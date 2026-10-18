@@ -32,6 +32,9 @@ Everything else, including `recommend_for_playlist`, `review_proposals`,
 4. On "yes": `apply_proposals_review` with exactly those lists. Discards go to the local
    `descartes.json` (gitignored) and are never recommended again.
 
+When the user says they already know (or don't want) some recommended songs, confirm the list and
+call `discard_songs` with those song objects. It only writes `descartes.json`, not the account.
+
 New tools that write must say so in their `description` and be added to this list.
 
 ## Secrets
