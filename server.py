@@ -160,6 +160,7 @@ def _build_browser_json_from_cookie(cookie_path: Path, browser_path: Path) -> No
     }
 
     browser_path.write_text(json.dumps(browser_data, indent=2))
+    browser_path.chmod(0o600)
     log.info("Generated %s from %s", browser_path.name, cookie_path.name)
 
 

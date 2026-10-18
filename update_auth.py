@@ -96,6 +96,7 @@ def update_auth() -> bool:
     }
 
     BROWSER_PATH.write_text(json.dumps(browser_data, indent=2))
+    BROWSER_PATH.chmod(0o600)
     print(f"✅ Written {BROWSER_PATH}")
 
     # ── 4. Quick auth test ──────────────────────────────
