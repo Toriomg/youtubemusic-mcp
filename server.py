@@ -18,8 +18,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -153,13 +157,14 @@ def _build_browser_json_from_cookie(cookie_path: Path, browser_path: Path) -> No
         ),
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.5",
-        "X-Goog-AuthUser": "0",
+        "X-Goog-AuthUser": os.environ.get("YTMUSIC_AUTHUSER", "0"),  # account slot when several are signed in
         "x-origin": "https://music.youtube.com",
         "Cookie": cookie_string,
         "authorization": authorization,
     }
 
     browser_path.write_text(json.dumps(browser_data, indent=2))
+    browser_path.chmod(0o600)
     log.info("Generated %s from %s", browser_path.name, cookie_path.name)
 
 
@@ -767,6 +772,413 @@ async def tool_get_listening_insights() -> list[TextContent]:
     })
 
 
+# ── Recommendation helpers ─────────────────────
+
+# YouTube answers HTTP 429 when ~20 artists are fetched at once; keep parallelism low.
+_YT_POOL = ThreadPoolExecutor(max_workers=3)
+
+# Marker words only count inside brackets or after " - ", so "Alive" or "Live Your Life" pass.
+# Remixes are allowed: in reggaeton they are often official tracks with extra artists.
+_VARIANT_RE = re.compile(
+    r"(?:[(\[]|\s-\s)[^)\]]*\b(live|en vivo|sped[\s-]?up|slowed|reverb|nightcore|radio edit|clean)\b",
+    re.IGNORECASE,
+)
+
+_DISCARDS_PATH = _SCRIPT_DIR / "descartes.json"
+
+
+def _is_variant(title: str | None) -> bool:
+    """True for live / sped up / slowed / clean versions."""
+    return bool(_VARIANT_RE.search(title or ""))
+
+
+def _norm(text: str | None) -> str:
+    """Lowercase without punctuation, so 'Tito "El Bambino"' == 'Tito El Bambino'."""
+    return re.sub(r"\W+", "", (text or "").lower())
+
+
+_VIDEO_TAG_RE = re.compile(
+    r"[(\[][^)\]]*\b(video|v[ií]deo|oficial|official|visualizer|lyrics?|letra|audio)\b[^)\]]*[)\]]",
+    re.IGNORECASE,
+)
+
+
+def _track_keys(song: dict) -> set[str]:
+    """Loose identities of a song, one per credited artist, so that the audio track and its music
+    video match ("PARADIXE" by Feid & Pirlo == "PARADIXE" by Pirlo,
+    "TRATRATRA - ANMI, JUSEPH (Video Oficial)" == "TRATRATRA")."""
+    artists = [_norm(a) for a in song.get("artists") or [song.get("artist")] if _norm(a)]
+    title = _VIDEO_TAG_RE.sub("", song.get("title") or "")
+    if " - " in title:
+        # Music video titles often read "Artist - Title" or "Title - Artist, Artist".
+        left, right = title.split(" - ", 1)
+        if any(a in _norm(left) for a in artists):
+            title = right
+        elif any(a in _norm(right) for a in artists):
+            title = left
+    core = _norm(title)
+    return {f"{core}|{a}" for a in artists} or {f"{core}|"}
+
+
+def _rec_song(track: dict) -> dict:
+    """_song_to_dict plus every credited artist (needed to tell collaborations apart)."""
+    return {**_song_to_dict(track), "artists": [_artist_name(a) for a in track.get("artists") or []]}
+
+
+def _plays(track: dict) -> float:
+    """'3.4M plays' → 3400000.0; 0 when unknown."""
+    m = re.match(r"([\d.,]+)\s*([KMB]?)", track.get("views") or "")
+    if not m:
+        return 0
+    return float(m.group(1).replace(",", "")) * {"": 1, "K": 1e3, "M": 1e6, "B": 1e9}[m.group(2)]
+
+
+def _release_date(yt: YTMusic, video_id: str) -> date | None:
+    """Upload date of a track; the album endpoint only gives the year."""
+    try:
+        mf = yt.get_song(video_id).get("microformat", {}).get("microformatDataRenderer", {})
+        raw = mf.get("uploadDate") or mf.get("publishDate")
+        return date.fromisoformat(raw[:10]) if raw else None
+    except Exception as exc:
+        log.warning("No release date for %s: %s", video_id, exc)
+        return None
+
+
+def _resolve_artist_id(yt: YTMusic, artist: str) -> str:
+    """Artist name → channelId, preferring an exact name match."""
+    results = [r for r in yt.search(artist, filter="artists", limit=5) if r.get("browseId")]
+    if not results:
+        raise SearchError(f'No artist found matching "{artist}".')
+    exact = next((r for r in results if _norm(r.get("artist")) == _norm(artist)), None)
+    return (exact or results[0])["browseId"]
+
+
+def _new_releases(yt: YTMusic, artist: dict, months: int) -> list[dict]:
+    """Albums and singles on the artist page released within the last `months`."""
+    cutoff = date.today() - timedelta(days=months * 30)
+    releases = []
+    for kind in ("singles", "albums"):
+        for rel in (artist.get(kind) or {}).get("results", []):
+            year = str(rel.get("year") or "")
+            if not year.isdigit() or int(year) < cutoff.year or not rel.get("browseId"):
+                continue
+            album = yt.get_album(rel["browseId"])
+            tracks = album.get("tracks", [])
+            released = None
+            if int(year) == cutoff.year and tracks and tracks[0].get("videoId"):
+                # Only the boundary year needs an exact date: one extra request per release.
+                released = _release_date(yt, tracks[0]["videoId"])
+                if released and released < cutoff:
+                    continue
+            title = album.get("title") or rel.get("title")
+            releases.append({
+                "title": title,
+                "type": album.get("type") or kind[:-1].title(),
+                "year": int(year),
+                "date": released.isoformat() if released else None,
+                "browseId": rel["browseId"],
+                "tracks": [{**_rec_song(t), "album": title, "plays": _plays(t)} for t in tracks],
+            })
+    return releases
+
+
+def _known_tracks(yt: YTMusic) -> tuple[set[str], set[str]]:
+    """(videoIds, track keys) of everything the user already knows: library, liked songs,
+    history, every library playlist and the local discard list (descartes.json)."""
+    cached = _cache_get("known_tracks")
+    if cached is not None:
+        return cached
+    songs = list(_get_library_songs_cached())
+    songs += yt.get_liked_songs(limit=None).get("tracks", [])
+    try:
+        songs += yt.get_history()
+    except Exception as exc:
+        log.warning("History unavailable, skipping: %s", exc)
+    for pl in _get_library_playlists_cached():
+        if pl.get("playlistId") in (None, "LM", "SE"):
+            continue
+        try:
+            songs += yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
+        except Exception as exc:
+            log.warning("Skipping playlist %s: %s", pl.get("title"), exc)
+    normalized = [_rec_song(s) for s in songs]
+    if _DISCARDS_PATH.exists():
+        normalized += json.loads(_DISCARDS_PATH.read_text())
+    known = (
+        {s["videoId"] for s in normalized if s.get("videoId")},
+        set().union(*(_track_keys(s) for s in normalized)),
+    )
+    _cache_set("known_tracks", known)
+    return known
+
+
+def _unheard_top_tracks(yt: YTMusic, artist: dict, limit: int, known: tuple[set[str], set[str]]) -> list[dict]:
+    """Artist's top songs, in popularity order, minus anything in `known`."""
+    songs = artist.get("songs") or {}
+    tracks = songs.get("results", [])
+    if songs.get("browseId"):
+        # The artist page only shows ~5; the "Songs" playlist has the full ranked list.
+        tracks = yt.get_playlist(songs["browseId"], limit=limit * 3 + 20).get("tracks") or tracks
+    ids, keys = known
+    unheard = []
+    for t in tracks:
+        song = _rec_song(t)
+        if song["videoId"] in ids or _track_keys(song) & keys:
+            continue
+        unheard.append(song)
+        if len(unheard) >= limit:
+            break
+    return unheard
+
+
+def _interleave(per_artist: list[list[dict]], cap: int, seen_ids: set[str], seen_keys: set[str]) -> list[dict]:
+    """Round-robin one song per artist until `cap`, skipping (and recording) duplicates."""
+    queues = [list(q) for q in per_artist]
+    picked: list[dict] = []
+    while len(picked) < cap and any(queues):
+        for queue in queues:
+            while queue:
+                song = queue.pop(0)
+                keys = _track_keys(song)
+                if song["videoId"] in seen_ids or keys & seen_keys:
+                    continue
+                seen_ids.add(song["videoId"])
+                seen_keys.update(keys)
+                picked.append(song)
+                break
+            if len(picked) >= cap:
+                break
+    return picked
+
+
+async def tool_get_artist_new_releases(artist: str, months: int = 12) -> list[TextContent]:
+    yt = get_yt()
+    data = yt.get_artist(_resolve_artist_id(yt, artist))
+    return _json_response({
+        "artist": data.get("name", artist),
+        "months": months,
+        "releases": _new_releases(yt, data, months),
+    })
+
+
+async def tool_get_unheard_top_tracks(artist: str, limit: int = 10) -> list[TextContent]:
+    yt = get_yt()
+    data = yt.get_artist(_resolve_artist_id(yt, artist))
+    return _json_response({
+        "artist": data.get("name", artist),
+        "tracks": _unheard_top_tracks(yt, data, limit, _known_tracks(yt)),
+    })
+
+
+async def tool_recommend_for_playlist(
+    playlist_id: str,
+    months: int = 12,
+    max_novedades: int = 12,
+    max_hits: int = 12,
+    include_variants: bool = False,
+    max_artists: int = 20,
+) -> list[TextContent]:
+    yt = get_yt()
+    playlist = yt.get_playlist(playlist_id, limit=None)
+    tracks = playlist.get("tracks", [])
+
+    artist_counts: Counter = Counter()
+    artist_names: dict[str, str] = {}
+    for t in tracks:
+        first = (t.get("artists") or [{}])[0]
+        if isinstance(first, dict) and first.get("id"):
+            artist_counts[first["id"]] += 1
+            artist_names[first["id"]] = first.get("name") or ""
+    # ponytail: caps artists to bound API calls (~3 + releases per artist); raise max_artists for big playlists
+    artist_ids = [a for a, _ in artist_counts.most_common(max_artists)]
+    known_ids, known_keys = _known_tracks(yt)
+
+    def eligible(song: dict, artist: str) -> bool:
+        """Unknown, not a live/sped up/clean version, and the artist is credited on it."""
+        return bool(
+            song["videoId"]
+            and song["videoId"] not in known_ids
+            and not _track_keys(song) & known_keys
+            and (include_variants or not _is_variant(song["title"]))
+            and _norm(artist) in {_norm(a) for a in song["artists"]}
+        )
+
+    def fetch(channel_id: str) -> tuple[str, list[dict], list[dict]]:
+        name = artist_names.get(channel_id) or channel_id
+        try:
+            try:
+                data = yt.get_artist(channel_id)
+            except KeyError:
+                # Plain YouTube channels (not YT Music artist pages) fail to parse; retry by name.
+                data = yt.get_artist(_resolve_artist_id(yt, name))
+            name = data.get("name", name)
+            new: list[dict] = []
+            for rel in _new_releases(yt, data, months):
+                songs = [s for s in rel["tracks"] if eligible(s, name)]
+                if rel["type"] != "Single":
+                    # Albums / EPs: only their 2 most played tracks.
+                    songs = sorted(songs, key=lambda s: s["plays"], reverse=True)[:2]
+                new += [
+                    {**s, "release": rel["title"], "release_type": rel["type"], "date": rel["date"] or str(rel["year"])}
+                    for s in songs
+                ]
+            top = [s for s in _unheard_top_tracks(yt, data, 10, (known_ids, known_keys)) if eligible(s, name)]
+            return name, new, top
+        except Exception as exc:
+            log.warning("Recommendation fetch failed for %s (%s): %s", name, channel_id, exc)
+            return name, [], []
+
+    loop = asyncio.get_running_loop()
+    results = await asyncio.gather(*[loop.run_in_executor(_YT_POOL, fetch, cid) for cid in artist_ids])
+
+    in_playlist = [_rec_song(t) for t in tracks]
+    seen_ids = {s["videoId"] for s in in_playlist if s["videoId"]}
+    seen_keys = set().union(*(_track_keys(s) for s in in_playlist))
+    novedades = _interleave([new for _, new, _ in results], max_novedades, seen_ids, seen_keys)
+    hits = _interleave([top for _, _, top in results], max_hits, seen_ids, seen_keys)
+
+    return _json_response({
+        "playlistId": playlist_id,
+        "title": playlist.get("title", "Playlist"),
+        "artists_considered": [name for name, _, _ in results],
+        "novedades": novedades,
+        "hits_que_no_conoces": hits,
+    })
+
+
+# ── Proposals playlist cycle ───────────────────
+# recommend → fill "<title> - propuestas" → user likes songs on their phone → review → apply.
+
+_PROPOSALS_SUFFIX = " - propuestas"
+
+
+def _playlist_title(yt: YTMusic, playlist_id: str) -> str:
+    for pl in _get_library_playlists_cached():
+        if pl.get("playlistId") == playlist_id:
+            return pl.get("title") or playlist_id
+    return yt.get_playlist(playlist_id, limit=1).get("title") or playlist_id
+
+
+def _find_proposals(yt: YTMusic, playlist_id: str) -> tuple[str, str | None]:
+    """(proposals title, proposals playlistId or None if it doesn't exist yet)."""
+    title = _playlist_title(yt, playlist_id) + _PROPOSALS_SUFFIX
+    found = next((p["playlistId"] for p in _get_library_playlists_cached() if p.get("title") == title), None)
+    return title, found
+
+
+def _empty_playlist(yt: YTMusic, playlist_id: str, tracks: list[dict]) -> None:
+    items = [t for t in tracks if t.get("videoId") and t.get("setVideoId")]
+    if items:
+        yt.remove_playlist_items(playlist_id, items)
+
+
+def _add_discards(songs: list[dict]) -> int:
+    """Append songs (normalized dicts) to descartes.json, skipping ones already there. Returns how many."""
+    discards = json.loads(_DISCARDS_PATH.read_text()) if _DISCARDS_PATH.exists() else []
+    already = {d.get("videoId") for d in discards}
+    new = [s for s in songs if s.get("videoId") and s["videoId"] not in already]
+    new = list({s["videoId"]: s for s in new}.values())
+    _DISCARDS_PATH.write_text(json.dumps(discards + new, ensure_ascii=False, indent=1))
+    _cache_invalidate("known_tracks")
+    return len(new)
+
+
+def _review(yt: YTMusic, playlist_id: str) -> tuple[str, list[dict], list[dict], list[dict]]:
+    """(proposals id, proposals tracks, liked → add, rest → discard)."""
+    title, proposals_id = _find_proposals(yt, playlist_id)
+    if not proposals_id:
+        raise PlaylistError(f'There is no "{title}" playlist yet. Use fill_proposals_playlist first.')
+    tracks = yt.get_playlist(proposals_id, limit=None).get("tracks", [])
+    in_source = {t.get("videoId") for t in yt.get_playlist(playlist_id, limit=None).get("tracks", [])}
+    liked = [t for t in tracks if t.get("likeStatus") == "LIKE"]
+    to_add = [_song_to_dict(t) for t in liked if t.get("videoId") not in in_source]
+    to_discard = [_song_to_dict(t) for t in tracks if t.get("likeStatus") != "LIKE"]
+    return proposals_id, tracks, to_add, to_discard
+
+
+async def tool_fill_proposals_playlist(playlist_id: str, video_ids: list[str]) -> list[TextContent]:
+    yt = get_yt()
+    title, proposals_id = _find_proposals(yt, playlist_id)
+    try:
+        if proposals_id:
+            _empty_playlist(yt, proposals_id, yt.get_playlist(proposals_id, limit=None).get("tracks", []))
+            yt.add_playlist_items(proposals_id, video_ids, duplicates=False)
+            created = False
+        else:
+            result = yt.create_playlist(
+                title, f"Propuestas para {_playlist_title(yt, playlist_id)} (YouTube Music MCP)",
+                privacy_status="PRIVATE", video_ids=video_ids,
+            )
+            if not isinstance(result, str):
+                raise PlaylistError(f"create_playlist returned {result}")
+            proposals_id, created = result, True
+            _cache_invalidate("library_playlists")
+    except PlaylistError:
+        raise
+    except Exception as exc:
+        raise PlaylistError(f"Failed to fill {title}: {exc}") from exc
+    _cache_invalidate("known_tracks")
+    return _json_response({
+        "success": True,
+        "proposalsPlaylistId": proposals_id,
+        "title": title,
+        "created": created,
+        "songs": len(video_ids),
+    })
+
+
+async def tool_review_proposals(playlist_id: str) -> list[TextContent]:
+    yt = get_yt()
+    proposals_id, tracks, to_add, to_discard = _review(yt, playlist_id)
+    return _json_response({
+        "proposalsPlaylistId": proposals_id,
+        "total": len(tracks),
+        "to_add": to_add,
+        "to_discard": to_discard,
+    })
+
+
+async def tool_apply_proposals_review(
+    playlist_id: str, add_video_ids: list[str], discard_video_ids: list[str]
+) -> list[TextContent]:
+    yt = get_yt()
+    proposals_id, tracks, _, _ = _review(yt, playlist_id)
+    by_id = {t.get("videoId"): t for t in tracks}
+    try:
+        if add_video_ids:
+            yt.add_playlist_items(playlist_id, add_video_ids, duplicates=False)
+        discarded = _add_discards([_rec_song(by_id[v]) for v in discard_video_ids if v in by_id])
+        _empty_playlist(yt, proposals_id, tracks)
+    except Exception as exc:
+        raise PlaylistError(f"Failed to apply review: {exc}") from exc
+    _cache_invalidate("known_tracks")
+    return _json_response({
+        "success": True,
+        "added": len(add_video_ids),
+        "discarded": discarded,
+        "proposals_emptied": True,
+    })
+
+
+async def tool_discard_songs(songs: list[dict]) -> list[TextContent]:
+    for song in songs:
+        if not isinstance(song, dict) or not song.get("videoId") or not song.get("title"):
+            raise ValueError("each song needs at least videoId and title")
+    clean = [
+        {
+            "title": song["title"],
+            "artist": song.get("artist") or (song.get("artists") or [None])[0],
+            "artists": song.get("artists") or ([song["artist"]] if song.get("artist") else []),
+            "album": song.get("album"),
+            "videoId": song["videoId"],
+            "duration": song.get("duration"),
+        }
+        for song in songs
+    ]
+    added = _add_discards(clean)
+    return _json_response({"success": True, "discarded": added, "already_discarded": len(clean) - added})
+
+
 async def tool_get_server_info() -> list[TextContent]:
     cached_songs = _cache_get("library_songs")
     lib_size = len(cached_songs) if cached_songs else None
@@ -781,7 +1193,7 @@ async def tool_get_server_info() -> list[TextContent]:
         "cached_library_songs": lib_size,
         "cached_playlists": pl_size,
         "capabilities": {
-            "tools": 15,
+            "tools": len(TOOLS),
             "resources": 3,
             "prompts": 3,
             "features": ["async_parallel_search", "ttl_caching", "radio_similarity", "mood_genre_explorer", "charts", "listening_insights"],
@@ -867,7 +1279,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="create_playlist_from_songs",
-        description="Create a new YouTube Music playlist and add songs to it by search query.",
+        description="Create a new YouTube Music playlist and add songs to it by search query. WRITES to the user's account: only call after showing the exact song list and getting explicit user confirmation.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -910,7 +1322,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="add_songs_to_playlist",
-        description="Add songs to an existing playlist by search queries.",
+        description="Add songs to an existing playlist by search queries. WRITES to the user's account: only call after showing the exact song list and getting explicit user confirmation.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -929,7 +1341,8 @@ TOOLS: list[Tool] = [
         description=(
             "Agentic multi-step playlist builder. Matches your mood/genre to real YouTube Music categories, "
             "samples tracks, applies energy filtering, and optionally saves as a playlist. "
-            "Steps: fetch categories → match mood → pull playlists → sample tracks → energy filter → (optional) save."
+            "Steps: fetch categories → match mood → pull playlists → sample tracks → energy filter → (optional) save. "
+            "save_playlist=true WRITES to the user's account: only call after showing the exact song list and getting explicit user confirmation."
         ),
         inputSchema={
             "type": "object",
@@ -982,6 +1395,164 @@ TOOLS: list[Tool] = [
         name="get_server_info",
         description="Get metadata about this MCP server: auth method, version, cache state, and capabilities.",
         inputSchema={"type": "object", "properties": {}, "required": []},
+    ),
+    Tool(
+        name="get_artist_new_releases",
+        description=(
+            "Read-only. List an artist's singles and albums released in the last N months, each with its "
+            "full tracklist, videoIds and play counts. Releases from the boundary year are checked against "
+            "their exact upload date."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "artist": {"type": "string", "description": "Artist name, e.g. 'Rosalía'"},
+                "months": {"type": "number", "description": "Look-back window in months", "default": 12},
+            },
+            "required": ["artist"],
+        },
+    ),
+    Tool(
+        name="get_unheard_top_tracks",
+        description=(
+            "Read-only. An artist's most popular songs, in popularity order, excluding anything the user "
+            "already knows (library, liked songs, history, any of their playlists, or discarded before). "
+            "Use it to find an "
+            "artist's hits the user doesn't know yet."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "artist": {"type": "string", "description": "Artist name"},
+                "limit": {"type": "number", "description": "Max tracks to return", "default": 10},
+            },
+            "required": ["artist"],
+        },
+    ),
+    Tool(
+        name="recommend_for_playlist",
+        description=(
+            "Read-only. Recommend songs for an existing playlist based on the artists already in it "
+            "(most frequent first). Returns two separate lists, each round-robin across artists: "
+            "'novedades' (from those artists' releases in the last N months: every track of a single, "
+            "only the 2 most played of an album/EP) and 'hits_que_no_conoces' (their top songs). "
+            "Every song is one the user doesn't know yet (not in library, liked songs, history, any of "
+            "their playlists, or descartes.json), has the playlist artist credited (collaborations count), "
+            "and appears only once. Live, sped up, slowed, reverb, nightcore and clean/radio edit versions "
+            "are excluded unless include_variants=true; remixes are kept. "
+            "This tool never modifies the playlist: to add anything, show the list to the user, get "
+            "explicit confirmation, then call add_songs_to_playlist."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "playlist_id": {"type": "string", "description": "Playlist ID (from list_playlists)"},
+                "months": {"type": "number", "description": "Look-back window for new releases", "default": 12},
+                "max_novedades": {"type": "number", "description": "Max songs in 'novedades'", "default": 12},
+                "max_hits": {"type": "number", "description": "Max songs in 'hits_que_no_conoces'", "default": 12},
+                "include_variants": {
+                    "type": "boolean",
+                    "description": "Include live/sped up/slowed/clean versions (only if the user asks)",
+                    "default": False,
+                },
+                "max_artists": {
+                    "type": "number",
+                    "description": "Only consider the N most frequent artists in the playlist",
+                    "default": 20,
+                },
+            },
+            "required": ["playlist_id"],
+        },
+    ),
+    Tool(
+        name="fill_proposals_playlist",
+        description=(
+            "Step 2 of the proposals cycle (after recommend_for_playlist). Puts the given songs into the "
+            "private playlist '<playlist title> - propuestas', creating it if needed; if it already exists "
+            "it is EMPTIED first and refilled. The user then listens on their phone and likes the songs "
+            "they want to keep. WRITES to the user's account: only call after showing the exact song list "
+            "and getting explicit user confirmation."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "playlist_id": {"type": "string", "description": "The SOURCE playlist the proposals are for"},
+                "video_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "videoIds to propose (from recommend_for_playlist)",
+                },
+            },
+            "required": ["playlist_id", "video_ids"],
+        },
+    ),
+    Tool(
+        name="review_proposals",
+        description=(
+            "Read-only. Step 3 of the proposals cycle: looks at '<playlist title> - propuestas' and splits "
+            "it into 'to_add' (songs the user liked, not yet in the source playlist) and 'to_discard' "
+            "(everything not liked). Show both lists to the user before apply_proposals_review."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"playlist_id": {"type": "string", "description": "The SOURCE playlist"}},
+            "required": ["playlist_id"],
+        },
+    ),
+    Tool(
+        name="apply_proposals_review",
+        description=(
+            "Step 4 of the proposals cycle: adds add_video_ids to the source playlist, records "
+            "discard_video_ids in the local discard list (they are never recommended again), and empties "
+            "the proposals playlist. Pass exactly the lists from review_proposals that the user confirmed. "
+            "WRITES to the user's account: only call after showing the exact song lists and getting "
+            "explicit user confirmation."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "playlist_id": {"type": "string", "description": "The SOURCE playlist"},
+                "add_video_ids": {"type": "array", "items": {"type": "string"}, "description": "Songs to add"},
+                "discard_video_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Songs to discard",
+                },
+            },
+            "required": ["playlist_id", "add_video_ids", "discard_video_ids"],
+        },
+    ),
+    Tool(
+        name="discard_songs",
+        description=(
+            "Mark songs as discarded so they are never recommended again, e.g. when the user says "
+            "'I already know these' or 'I don't want these' about songs from recommend_for_playlist. "
+            "Pass the song objects as returned by recommend_for_playlist (title, artist(s) and videoId are "
+            "what matter: matching also catches other versions of the same song, like its music video). "
+            "Only writes the local descartes.json file; it does NOT touch the YouTube Music account. "
+            "Confirm the exact list with the user before calling it."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "songs": {
+                    "type": "array",
+                    "description": "Songs to discard",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "videoId": {"type": "string"},
+                            "title": {"type": "string"},
+                            "artist": {"type": "string"},
+                            "artists": {"type": "array", "items": {"type": "string"}},
+                            "album": {"type": "string"},
+                        },
+                        "required": ["videoId", "title"],
+                    },
+                },
+            },
+            "required": ["songs"],
+        },
     ),
 ]
 
@@ -1049,6 +1620,44 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 return await tool_get_listening_insights()
             case "get_server_info":
                 return await tool_get_server_info()
+            case "get_artist_new_releases":
+                if not args.get("artist"):
+                    raise ValueError("artist is required")
+                return await tool_get_artist_new_releases(args["artist"], int(args.get("months", 12)))
+            case "get_unheard_top_tracks":
+                if not args.get("artist"):
+                    raise ValueError("artist is required")
+                return await tool_get_unheard_top_tracks(args["artist"], int(args.get("limit", 10)))
+            case "recommend_for_playlist":
+                if not args.get("playlist_id"):
+                    raise ValueError("playlist_id is required")
+                return await tool_recommend_for_playlist(
+                    args["playlist_id"], int(args.get("months", 12)), int(args.get("max_novedades", 12)),
+                    int(args.get("max_hits", 12)), bool(args.get("include_variants", False)),
+                    int(args.get("max_artists", 20)),
+                )
+            case "fill_proposals_playlist":
+                if not args.get("playlist_id"):
+                    raise ValueError("playlist_id is required")
+                if not isinstance(args.get("video_ids"), list) or not args["video_ids"]:
+                    raise ValueError("video_ids must be a non-empty list")
+                return await tool_fill_proposals_playlist(args["playlist_id"], args["video_ids"])
+            case "review_proposals":
+                if not args.get("playlist_id"):
+                    raise ValueError("playlist_id is required")
+                return await tool_review_proposals(args["playlist_id"])
+            case "apply_proposals_review":
+                if not args.get("playlist_id"):
+                    raise ValueError("playlist_id is required")
+                if not isinstance(args.get("add_video_ids"), list) or not isinstance(args.get("discard_video_ids"), list):
+                    raise ValueError("add_video_ids and discard_video_ids must be lists")
+                return await tool_apply_proposals_review(
+                    args["playlist_id"], args["add_video_ids"], args["discard_video_ids"]
+                )
+            case "discard_songs":
+                if not isinstance(args.get("songs"), list) or not args["songs"]:
+                    raise ValueError("songs must be a non-empty list")
+                return await tool_discard_songs(args["songs"])
             case _:
                 raise ValueError(f"Unknown tool: {name}")
 
@@ -1197,7 +1806,7 @@ async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptRe
                             "3. Use `get_recommendations` to get a seed list\n"
                             "4. Use `find_similar_songs` on 2-3 of my favourite tracks\n"
                             "5. Compile a 20-song Weekly Discovery Mix playlist\n"
-                            "6. Use `create_playlist_from_songs` to save it as 'Weekly Discovery — [date]'\n\n"
+                            "6. Show me the final list and ask before saving it with `create_playlist_from_songs` as 'Weekly Discovery — [date]'\n\n"
                             "Show me each step's reasoning as you go."
                         ),
                     ),
@@ -1249,7 +1858,7 @@ async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptRe
                             f"3. Use `find_similar_songs` on their most iconic song to find similar artists\n"
                             "4. Check if any of their songs are in my library using `get_library_stats`\n"
                             "5. Give me a curated listening plan: 'Start here → then this → then explore'\n"
-                            f"6. Create a '{artist} Deep Dive' playlist with their essential tracks\n\n"
+                            f"6. Propose a '{artist} Deep Dive' playlist and ask me before creating it\n\n"
                             "I want to understand their artistry, not just list songs."
                         ),
                     ),
