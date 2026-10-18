@@ -49,6 +49,7 @@ headers.json
 client_secret.json
 client_secret_*.json
 cookie.txt
+descartes.json
 
 # IDE
 .vscode/

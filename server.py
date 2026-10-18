@@ -777,17 +777,53 @@ async def tool_get_listening_insights() -> list[TextContent]:
 # YouTube answers HTTP 429 when ~20 artists are fetched at once; keep parallelism low.
 _YT_POOL = ThreadPoolExecutor(max_workers=3)
 
-_VARIANT_RE = re.compile(r"\b(live|remix(ed)?|sped[\s-]?up|slowed|reverb|nightcore)\b", re.IGNORECASE)
+# Marker words only count inside brackets or after " - ", so "Alive" or "Live Your Life" pass.
+# Remixes are allowed: in reggaeton they are often official tracks with extra artists.
+_VARIANT_RE = re.compile(
+    r"(?:[(\[]|\s-\s)[^)\]]*\b(live|en vivo|sped[\s-]?up|slowed|reverb|nightcore|radio edit|clean)\b",
+    re.IGNORECASE,
+)
+
+_DISCARDS_PATH = _SCRIPT_DIR / "descartes.json"
 
 
 def _is_variant(title: str | None) -> bool:
-    """True for live / remix / sped up / slowed versions."""
+    """True for live / sped up / slowed / clean versions."""
     return bool(_VARIANT_RE.search(title or ""))
+
+
+def _norm(text: str | None) -> str:
+    """Lowercase without punctuation, so 'Tito "El Bambino"' == 'Tito El Bambino'."""
+    return re.sub(r"\W+", "", (text or "").lower())
 
 
 def _track_key(song: dict) -> str:
     """Loose identity for a normalized song, so audio and video versions match."""
-    return f"{(song.get('title') or '').lower().strip()}|{(song.get('artist') or '').lower().strip()}"
+    return f"{_norm(song.get('title'))}|{_norm(song.get('artist'))}"
+
+
+def _rec_song(track: dict) -> dict:
+    """_song_to_dict plus every credited artist (needed to tell collaborations apart)."""
+    return {**_song_to_dict(track), "artists": [_artist_name(a) for a in track.get("artists") or []]}
+
+
+def _plays(track: dict) -> float:
+    """'3.4M plays' → 3400000.0; 0 when unknown."""
+    m = re.match(r"([\d.,]+)\s*([KMB]?)", track.get("views") or "")
+    if not m:
+        return 0
+    return float(m.group(1).replace(",", "")) * {"": 1, "K": 1e3, "M": 1e6, "B": 1e9}[m.group(2)]
+
+
+def _release_date(yt: YTMusic, video_id: str) -> date | None:
+    """Upload date of a track; the album endpoint only gives the year."""
+    try:
+        mf = yt.get_song(video_id).get("microformat", {}).get("microformatDataRenderer", {})
+        raw = mf.get("uploadDate") or mf.get("publishDate")
+        return date.fromisoformat(raw[:10]) if raw else None
+    except Exception as exc:
+        log.warning("No release date for %s: %s", video_id, exc)
+        return None
 
 
 def _resolve_artist_id(yt: YTMusic, artist: str) -> str:
@@ -795,35 +831,42 @@ def _resolve_artist_id(yt: YTMusic, artist: str) -> str:
     results = [r for r in yt.search(artist, filter="artists", limit=5) if r.get("browseId")]
     if not results:
         raise SearchError(f'No artist found matching "{artist}".')
-    exact = next((r for r in results if (r.get("artist") or "").lower() == artist.lower()), None)
+    exact = next((r for r in results if _norm(r.get("artist")) == _norm(artist)), None)
     return (exact or results[0])["browseId"]
 
 
 def _new_releases(yt: YTMusic, artist: dict, months: int) -> list[dict]:
     """Albums and singles on the artist page released within the last `months`."""
-    # ponytail: YT Music only exposes the release *year*, so the cutoff is year-granular
-    # (months=6 in October also includes January–March releases).
-    cutoff_year = (date.today() - timedelta(days=months * 30)).year
+    cutoff = date.today() - timedelta(days=months * 30)
     releases = []
     for kind in ("singles", "albums"):
         for rel in (artist.get(kind) or {}).get("results", []):
             year = str(rel.get("year") or "")
-            if not year.isdigit() or int(year) < cutoff_year or not rel.get("browseId"):
+            if not year.isdigit() or int(year) < cutoff.year or not rel.get("browseId"):
                 continue
             album = yt.get_album(rel["browseId"])
+            tracks = album.get("tracks", [])
+            released = None
+            if int(year) == cutoff.year and tracks and tracks[0].get("videoId"):
+                # Only the boundary year needs an exact date: one extra request per release.
+                released = _release_date(yt, tracks[0]["videoId"])
+                if released and released < cutoff:
+                    continue
             title = album.get("title") or rel.get("title")
             releases.append({
                 "title": title,
                 "type": album.get("type") or kind[:-1].title(),
                 "year": int(year),
+                "date": released.isoformat() if released else None,
                 "browseId": rel["browseId"],
-                "tracks": [{**_song_to_dict(t), "album": title} for t in album.get("tracks", [])],
+                "tracks": [{**_rec_song(t), "album": title, "plays": _plays(t)} for t in tracks],
             })
     return releases
 
 
 def _known_tracks(yt: YTMusic) -> tuple[set[str], set[str]]:
-    """(videoIds, track keys) of everything in the library, liked songs and history."""
+    """(videoIds, track keys) of everything the user already knows: library, liked songs,
+    history, every library playlist and the local discard list (descartes.json)."""
     cached = _cache_get("known_tracks")
     if cached is not None:
         return cached
@@ -833,8 +876,20 @@ def _known_tracks(yt: YTMusic) -> tuple[set[str], set[str]]:
         songs += yt.get_history()
     except Exception as exc:
         log.warning("History unavailable, skipping: %s", exc)
+    for pl in _get_library_playlists_cached():
+        if pl.get("playlistId") in (None, "LM", "SE"):
+            continue
+        try:
+            songs += yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
+        except Exception as exc:
+            log.warning("Skipping playlist %s: %s", pl.get("title"), exc)
     normalized = [_song_to_dict(s) for s in songs]
-    known = ({s["videoId"] for s in normalized if s["videoId"]}, {_track_key(s) for s in normalized})
+    if _DISCARDS_PATH.exists():
+        normalized += json.loads(_DISCARDS_PATH.read_text())
+    known = (
+        {s["videoId"] for s in normalized if s.get("videoId")},
+        {_track_key(s) for s in normalized},
+    )
     _cache_set("known_tracks", known)
     return known
 
@@ -849,7 +904,7 @@ def _unheard_top_tracks(yt: YTMusic, artist: dict, limit: int, known: tuple[set[
     ids, keys = known
     unheard = []
     for t in tracks:
-        song = _song_to_dict(t)
+        song = _rec_song(t)
         if song["videoId"] in ids or _track_key(song) in keys:
             continue
         unheard.append(song)
@@ -858,7 +913,27 @@ def _unheard_top_tracks(yt: YTMusic, artist: dict, limit: int, known: tuple[set[
     return unheard
 
 
-async def tool_get_artist_new_releases(artist: str, months: int = 6) -> list[TextContent]:
+def _interleave(per_artist: list[list[dict]], cap: int, seen_ids: set[str], seen_keys: set[str]) -> list[dict]:
+    """Round-robin one song per artist until `cap`, skipping (and recording) duplicates."""
+    queues = [list(q) for q in per_artist]
+    picked: list[dict] = []
+    while len(picked) < cap and any(queues):
+        for queue in queues:
+            while queue:
+                song = queue.pop(0)
+                key = _track_key(song)
+                if song["videoId"] in seen_ids or key in seen_keys:
+                    continue
+                seen_ids.add(song["videoId"])
+                seen_keys.add(key)
+                picked.append(song)
+                break
+            if len(picked) >= cap:
+                break
+    return picked
+
+
+async def tool_get_artist_new_releases(artist: str, months: int = 12) -> list[TextContent]:
     yt = get_yt()
     data = yt.get_artist(_resolve_artist_id(yt, artist))
     return _json_response({
@@ -879,8 +954,9 @@ async def tool_get_unheard_top_tracks(artist: str, limit: int = 10) -> list[Text
 
 async def tool_recommend_for_playlist(
     playlist_id: str,
-    months: int = 6,
-    hits_per_artist: int = 5,
+    months: int = 12,
+    max_novedades: int = 12,
+    max_hits: int = 12,
     include_variants: bool = False,
     max_artists: int = 20,
 ) -> list[TextContent]:
@@ -897,7 +973,17 @@ async def tool_recommend_for_playlist(
             artist_names[first["id"]] = first.get("name") or ""
     # ponytail: caps artists to bound API calls (~3 + releases per artist); raise max_artists for big playlists
     artist_ids = [a for a, _ in artist_counts.most_common(max_artists)]
-    known = _known_tracks(yt)
+    known_ids, known_keys = _known_tracks(yt)
+
+    def eligible(song: dict, artist: str) -> bool:
+        """Unknown, not a live/sped up/clean version, and the artist is credited on it."""
+        return bool(
+            song["videoId"]
+            and song["videoId"] not in known_ids
+            and _track_key(song) not in known_keys
+            and (include_variants or not _is_variant(song["title"]))
+            and _norm(artist) in {_norm(a) for a in song["artists"]}
+        )
 
     def fetch(channel_id: str) -> tuple[str, list[dict], list[dict]]:
         name = artist_names.get(channel_id) or channel_id
@@ -907,12 +993,19 @@ async def tool_recommend_for_playlist(
             except KeyError:
                 # Plain YouTube channels (not YT Music artist pages) fail to parse; retry by name.
                 data = yt.get_artist(_resolve_artist_id(yt, name))
-            # Over-fetch hits: some get dropped below as variants / duplicates.
-            return (
-                data.get("name", name),
-                _new_releases(yt, data, months),
-                _unheard_top_tracks(yt, data, hits_per_artist * 2, known),
-            )
+            name = data.get("name", name)
+            new: list[dict] = []
+            for rel in _new_releases(yt, data, months):
+                songs = [s for s in rel["tracks"] if eligible(s, name)]
+                if rel["type"] != "Single":
+                    # Albums / EPs: only their 2 most played tracks.
+                    songs = sorted(songs, key=lambda s: s["plays"], reverse=True)[:2]
+                new += [
+                    {**s, "release": rel["title"], "release_type": rel["type"], "date": rel["date"] or str(rel["year"])}
+                    for s in songs
+                ]
+            top = [s for s in _unheard_top_tracks(yt, data, 10, (known_ids, known_keys)) if eligible(s, name)]
+            return name, new, top
         except Exception as exc:
             log.warning("Recommendation fetch failed for %s (%s): %s", name, channel_id, exc)
             return name, [], []
@@ -923,31 +1016,8 @@ async def tool_recommend_for_playlist(
     in_playlist = [_song_to_dict(t) for t in tracks]
     seen_ids = {s["videoId"] for s in in_playlist if s["videoId"]}
     seen_keys = {_track_key(s) for s in in_playlist}
-
-    def take(song: dict) -> bool:
-        key = _track_key(song)
-        if not song["videoId"] or song["videoId"] in seen_ids or key in seen_keys:
-            return False
-        if not include_variants and _is_variant(song["title"]):
-            return False
-        seen_ids.add(song["videoId"])
-        seen_keys.add(key)
-        return True
-
-    novedades = [
-        {**song, "release": rel["title"], "release_type": rel["type"], "year": rel["year"]}
-        for _, releases, _ in results
-        for rel in releases
-        for song in rel["tracks"]
-        if take(song)
-    ]
-    hits: list[dict] = []
-    for _, _, top in results:
-        picked = 0
-        for song in top:
-            if picked < hits_per_artist and take(song):
-                hits.append(song)
-                picked += 1
+    novedades = _interleave([new for _, new, _ in results], max_novedades, seen_ids, seen_keys)
+    hits = _interleave([top for _, _, top in results], max_hits, seen_ids, seen_keys)
 
     return _json_response({
         "playlistId": playlist_id,
@@ -1179,14 +1249,14 @@ TOOLS: list[Tool] = [
         name="get_artist_new_releases",
         description=(
             "Read-only. List an artist's singles and albums released in the last N months, each with its "
-            "full tracklist and videoIds. YouTube Music only exposes the release year, so the window is "
-            "year-granular: everything from the year of (today - N months) onward is included."
+            "full tracklist, videoIds and play counts. Releases from the boundary year are checked against "
+            "their exact upload date."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "artist": {"type": "string", "description": "Artist name, e.g. 'Rosalía'"},
-                "months": {"type": "number", "description": "Look-back window in months", "default": 6},
+                "months": {"type": "number", "description": "Look-back window in months", "default": 12},
             },
             "required": ["artist"],
         },
@@ -1195,7 +1265,8 @@ TOOLS: list[Tool] = [
         name="get_unheard_top_tracks",
         description=(
             "Read-only. An artist's most popular songs, in popularity order, excluding anything the user "
-            "already has in their library, liked songs, or recent listening history. Use it to find an "
+            "already knows (library, liked songs, history, any of their playlists, or discarded before). "
+            "Use it to find an "
             "artist's hits the user doesn't know yet."
         ),
         inputSchema={
@@ -1211,10 +1282,13 @@ TOOLS: list[Tool] = [
         name="recommend_for_playlist",
         description=(
             "Read-only. Recommend songs for an existing playlist based on the artists already in it "
-            "(most frequent first). Returns two separate lists: 'novedades' (tracks from those artists' "
-            "releases in the last N months) and 'hits_que_no_conoces' (their top songs the user hasn't "
-            "saved, liked or played). No duplicates across lists or with the playlist itself. Live, remix, "
-            "sped up, slowed and nightcore versions are excluded unless include_variants=true. "
+            "(most frequent first). Returns two separate lists, each round-robin across artists: "
+            "'novedades' (from those artists' releases in the last N months: every track of a single, "
+            "only the 2 most played of an album/EP) and 'hits_que_no_conoces' (their top songs). "
+            "Every song is one the user doesn't know yet (not in library, liked songs, history, any of "
+            "their playlists, or descartes.json), has the playlist artist credited (collaborations count), "
+            "and appears only once. Live, sped up, slowed, reverb, nightcore and clean/radio edit versions "
+            "are excluded unless include_variants=true; remixes are kept. "
             "This tool never modifies the playlist: to add anything, show the list to the user, get "
             "explicit confirmation, then call add_songs_to_playlist."
         ),
@@ -1222,11 +1296,12 @@ TOOLS: list[Tool] = [
             "type": "object",
             "properties": {
                 "playlist_id": {"type": "string", "description": "Playlist ID (from list_playlists)"},
-                "months": {"type": "number", "description": "Look-back window for new releases", "default": 6},
-                "hits_per_artist": {"type": "number", "description": "Max unheard hits per artist", "default": 5},
+                "months": {"type": "number", "description": "Look-back window for new releases", "default": 12},
+                "max_novedades": {"type": "number", "description": "Max songs in 'novedades'", "default": 12},
+                "max_hits": {"type": "number", "description": "Max songs in 'hits_que_no_conoces'", "default": 12},
                 "include_variants": {
                     "type": "boolean",
-                    "description": "Include live/remix/sped up/slowed versions (only if the user asks)",
+                    "description": "Include live/sped up/slowed/clean versions (only if the user asks)",
                     "default": False,
                 },
                 "max_artists": {
@@ -1307,7 +1382,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             case "get_artist_new_releases":
                 if not args.get("artist"):
                     raise ValueError("artist is required")
-                return await tool_get_artist_new_releases(args["artist"], int(args.get("months", 6)))
+                return await tool_get_artist_new_releases(args["artist"], int(args.get("months", 12)))
             case "get_unheard_top_tracks":
                 if not args.get("artist"):
                     raise ValueError("artist is required")
@@ -1316,8 +1391,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 if not args.get("playlist_id"):
                     raise ValueError("playlist_id is required")
                 return await tool_recommend_for_playlist(
-                    args["playlist_id"], int(args.get("months", 6)), int(args.get("hits_per_artist", 5)),
-                    bool(args.get("include_variants", False)), int(args.get("max_artists", 20)),
+                    args["playlist_id"], int(args.get("months", 12)), int(args.get("max_novedades", 12)),
+                    int(args.get("max_hits", 12)), bool(args.get("include_variants", False)),
+                    int(args.get("max_artists", 20)),
                 )
             case _:
                 raise ValueError(f"Unknown tool: {name}")

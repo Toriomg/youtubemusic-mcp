@@ -522,59 +522,79 @@ class TestToolRouting:
 
 THIS_YEAR = str(server.date.today().year)
 
+KENDRICK = [{"name": "Kendrick Lamar", "id": "UCkendrick"}]
+OTHER = [{"name": "Other Guy", "id": "UCother"}]
+
+
+def song(title, video_id, artists=KENDRICK, views=None):
+    return {"title": title, "artists": artists, "videoId": video_id, "views": views}
+
+
 MOCK_ARTIST = {
     "name": "Kendrick Lamar",
-    "songs": {
-        "browseId": "VLPLkendricktop",
-        "results": [MOCK_SONGS[0]],
-    },
+    "songs": {"browseId": "VLPLkendricktop", "results": [MOCK_SONGS[0]]},
     "singles": {"results": [
         {"title": "New Single", "year": THIS_YEAR, "browseId": "MPREsingle"},
+        {"title": "Collab Single", "year": THIS_YEAR, "browseId": "MPREcollab"},
         {"title": "Old Single", "year": "2015", "browseId": "MPREold"},
     ]},
-    "albums": {"results": [{"title": "DAMN.", "year": "2017", "browseId": "MPREdamn"}]},
+    "albums": {"results": [
+        {"title": "New Album", "year": THIS_YEAR, "browseId": "MPREalbum"},
+        {"title": "DAMN.", "year": "2017", "browseId": "MPREdamn"},
+    ]},
 }
 
-KENDRICK = [{"name": "Kendrick Lamar", "id": "UCkendrick"}]
-
-MOCK_ALBUM = {
-    "title": "New Single",
-    "type": "Single",
-    "tracks": [
-        {"title": "New Single", "artists": KENDRICK, "videoId": "vidNew"},
-        {"title": "New Single (Sped Up)", "artists": KENDRICK, "videoId": "vidSped"},
-        {"title": "New Single - Live", "artists": KENDRICK, "videoId": "vidLive"},
-    ],
+MOCK_ALBUMS = {
+    "MPREsingle": {"title": "New Single", "type": "Single", "tracks": [
+        song("New Single", "vidNew"),
+        song("New Single (Sped Up)", "vidSped"),
+        song("New Single - Live", "vidLive"),
+    ]},
+    "MPREcollab": {"title": "Collab Single", "type": "Single", "tracks": [
+        song("Collab Single (feat. Kendrick Lamar)", "vidFeat", OTHER + KENDRICK),
+        song("Uncredited B-side", "vidUncredited", OTHER),
+    ]},
+    "MPREalbum": {"title": "New Album", "type": "Album", "tracks": [
+        song("Album Intro", "vidA1", views="1.2M plays"),
+        song("Album Banger", "vidA2", views="5M plays"),
+        song("Album Hit", "vidA3", views="3.4M plays"),
+    ]},
 }
 
 MOCK_TOP_SONGS = {"tracks": [
     MOCK_SONGS[0],  # HUMBLE. — in library
-    {"title": "Money Trees", "artists": KENDRICK, "videoId": "ydR3WN5yVU8"},
-    {"title": "Alright", "artists": KENDRICK, "videoId": "vidAlright"},  # liked
-    {"title": "DNA.", "artists": KENDRICK, "videoId": "otherDNAvideo"},  # same song, other videoId
-    {"title": "Swimming Pools (Remix)", "artists": KENDRICK, "videoId": "vidRemix"},
-    {"title": "Not Like Us", "artists": KENDRICK, "videoId": "vidNLU"},
+    song("Money Trees", "ydR3WN5yVU8"),  # in the target playlist
+    song("Alright", "vidAlright"),  # liked
+    song("DNA.", "otherDNAvideo"),  # in library by title, different videoId
+    song("Poetic Justice", "vidPoetic"),  # in another playlist of the user
+    song("Discarded Song", "vidDiscarded"),  # in descartes.json
+    song("Swimming Pools (Remix)", "vidRemix"),  # remixes are allowed
+    song("Not Like Us (Clean)", "vidClean"),  # clean versions are not
+    song("Ozuna Thing", "vidOzuna", OTHER),  # Kendrick not credited
+    song("Not Like Us", "vidNLU"),
 ]}
+
+MOCK_PLAYLIST_TRACKS = {
+    "VLPLkendricktop": MOCK_TOP_SONGS,
+    "PLkendrick": {"title": "Kendrick Mix", "tracks": [song("Money Trees", "ydR3WN5yVU8")]},
+    "PLrandom1": {"title": "Rap Favourites", "tracks": [song("Poetic Justice", "vidPoetic")]},
+    "PLrandom2": {"title": "Late Night Chill", "tracks": []},
+}
 
 
 @pytest.fixture
-def rec_yt(mock_yt):
+def rec_yt(mock_yt, tmp_path, monkeypatch):
     mock_yt.search.return_value = [
         {"resultType": "artist", "artist": "Kendrick Lamar Tribute", "browseId": "UCfake"},
         {"resultType": "artist", "artist": "Kendrick Lamar", "browseId": "UCkendrick"},
     ]
     mock_yt.get_artist.return_value = MOCK_ARTIST
-    mock_yt.get_album.return_value = MOCK_ALBUM
-    mock_yt.get_liked_songs.return_value = {"tracks": [{"title": "Alright", "artists": KENDRICK, "videoId": "vidAlright"}]}
-
-    def get_playlist(playlist_id, limit=None):
-        if playlist_id == "VLPLkendricktop":
-            return MOCK_TOP_SONGS
-        return {"title": "Kendrick Mix", "tracks": [
-            {"title": "Money Trees", "artists": KENDRICK, "videoId": "ydR3WN5yVU8"},
-        ]}
-
-    mock_yt.get_playlist.side_effect = get_playlist
+    mock_yt.get_album.side_effect = lambda browse_id: MOCK_ALBUMS[browse_id]
+    mock_yt.get_liked_songs.return_value = {"tracks": [song("Alright", "vidAlright")]}
+    mock_yt.get_playlist.side_effect = lambda playlist_id, limit=None: MOCK_PLAYLIST_TRACKS[playlist_id]
+    discards = tmp_path / "descartes.json"
+    discards.write_text(json.dumps([{"title": "Discarded Song", "artist": "Kendrick Lamar", "videoId": "vidDiscarded"}]))
+    monkeypatch.setattr(server, "_DISCARDS_PATH", discards)
     return mock_yt
 
 
@@ -582,51 +602,83 @@ class TestRecommendations:
     def test_is_variant(self):
         assert server._is_variant("Song (Sped Up)")
         assert server._is_variant("Song - Live at Wembley")
-        assert server._is_variant("Song (Remix)")
+        assert server._is_variant("Song (Clean)")
+        assert server._is_variant("Song [Radio Edit]")
+        assert not server._is_variant("Song (Remix)")
         assert not server._is_variant("Alive")
-        assert not server._is_variant("Deliver")
+        assert not server._is_variant("Live Your Life")
+        assert not server._is_variant("Clean Hands")
+
+    def test_plays(self):
+        assert server._plays({"views": "3.4M plays"}) == 3_400_000
+        assert server._plays({"views": "850K plays"}) == 850_000
+        assert server._plays({}) == 0
 
     def test_new_releases_filters_by_year_and_resolves_exact_artist(self, rec_yt):
-        result = asyncio.run(server.tool_get_artist_new_releases("kendrick lamar", months=6))
+        result = asyncio.run(server.tool_get_artist_new_releases("kendrick lamar"))
         data = json.loads(result[0].text)
         rec_yt.get_artist.assert_called_once_with("UCkendrick")
-        rec_yt.get_album.assert_called_once_with("MPREsingle")
-        assert [r["title"] for r in data["releases"]] == ["New Single"]
+        assert [r["title"] for r in data["releases"]] == ["New Single", "Collab Single", "New Album"]
         assert data["releases"][0]["tracks"][0]["videoId"] == "vidNew"
 
-    def test_unheard_top_tracks_excludes_library_likes_history(self, rec_yt):
-        result = asyncio.run(server.tool_get_unheard_top_tracks("Kendrick Lamar", limit=10))
+    def test_new_releases_boundary_year_uses_exact_date(self, rec_yt):
+        cutoff = server.date.today() - server.timedelta(days=12 * 30)
+        artist = {"singles": {"results": [
+            {"title": "Too Old", "year": str(cutoff.year), "browseId": "MPREold1"},
+            {"title": "Recent", "year": str(cutoff.year), "browseId": "MPREnew1"},
+        ]}}
+        rec_yt.get_album.side_effect = lambda browse_id: {"title": browse_id, "type": "Single",
+                                                          "tracks": [song("x", "vid_" + browse_id)]}
+        dates = {"vid_MPREold1": cutoff - server.timedelta(days=5), "vid_MPREnew1": cutoff + server.timedelta(days=5)}
+        rec_yt.get_song.side_effect = lambda video_id: {
+            "microformat": {"microformatDataRenderer": {"uploadDate": dates[video_id].isoformat() + "T10:00:00-07:00"}}
+        }
+        releases = server._new_releases(rec_yt, artist, months=12)
+        assert [r["title"] for r in releases] == ["MPREnew1"]
+        assert releases[0]["date"] == dates["vid_MPREnew1"].isoformat()
+
+    def test_unheard_top_tracks_excludes_everything_known(self, rec_yt):
+        result = asyncio.run(server.tool_get_unheard_top_tracks("Kendrick Lamar", limit=20))
         titles = [t["title"] for t in json.loads(result[0].text)["tracks"]]
         assert "HUMBLE." not in titles  # library
         assert "Alright" not in titles  # liked
-        assert "DNA." not in titles  # history/library by title, different videoId
-        assert "Money Trees" in titles and "Not Like Us" in titles
+        assert "DNA." not in titles  # library, by title
+        assert "Poetic Justice" not in titles  # another playlist
+        assert "Discarded Song" not in titles  # descartes.json
+        assert "Not Like Us" in titles
 
     def test_unheard_top_tracks_respects_limit(self, rec_yt):
         result = asyncio.run(server.tool_get_unheard_top_tracks("Kendrick Lamar", limit=1))
         assert len(json.loads(result[0].text)["tracks"]) == 1
 
-    def test_recommend_for_playlist_two_lists_no_variants_no_dupes(self, rec_yt):
+    def test_recommend_for_playlist(self, rec_yt):
         result = asyncio.run(server.tool_recommend_for_playlist("PLkendrick"))
         data = json.loads(result[0].text)
-        assert [s["videoId"] for s in data["novedades"]] == ["vidNew"]
-        hit_ids = [s["videoId"] for s in data["hits_que_no_conoces"]]
-        assert "ydR3WN5yVU8" not in hit_ids  # already in playlist
-        assert "vidRemix" not in hit_ids
-        assert "vidNLU" in hit_ids
+        # Singles: every eligible track; credited collabs only; albums: 2 most played.
+        assert sorted(s["videoId"] for s in data["novedades"]) == sorted(["vidNew", "vidFeat", "vidA2", "vidA3"])
+        hit_ids = {s["videoId"] for s in data["hits_que_no_conoces"]}
+        assert hit_ids == {"vidRemix", "vidNLU"}
         all_ids = [s["videoId"] for s in data["novedades"] + data["hits_que_no_conoces"]]
         assert len(all_ids) == len(set(all_ids))
         rec_yt.add_playlist_items.assert_not_called()
         rec_yt.create_playlist.assert_not_called()
 
+    def test_recommend_for_playlist_caps(self, rec_yt):
+        result = asyncio.run(server.tool_recommend_for_playlist("PLkendrick", max_novedades=1, max_hits=1))
+        data = json.loads(result[0].text)
+        assert len(data["novedades"]) == 1 and len(data["hits_que_no_conoces"]) == 1
+
     def test_recommend_for_playlist_include_variants(self, rec_yt):
         result = asyncio.run(server.tool_recommend_for_playlist("PLkendrick", include_variants=True))
         data = json.loads(result[0].text)
-        assert {"vidNew", "vidSped", "vidLive"} <= {s["videoId"] for s in data["novedades"]}
+        assert {"vidSped", "vidLive"} <= {s["videoId"] for s in data["novedades"]}
 
-    def test_call_recommend_requires_playlist_id(self, rec_yt):
-        result = asyncio.run(server.call_tool("recommend_for_playlist", {}))
-        assert "error" in json.loads(result[0].text)
+    def test_interleave_round_robin_dedup_and_cap(self):
+        a = [{"title": "a1", "artist": "A", "videoId": "a1"}, {"title": "a2", "artist": "A", "videoId": "a2"}]
+        b = [{"title": "a1", "artist": "A", "videoId": "a1"}, {"title": "b1", "artist": "B", "videoId": "b1"}]
+        picked = server._interleave([a, b], 3, set(), set())
+        assert [s["videoId"] for s in picked] == ["a1", "b1", "a2"]
+        assert len(server._interleave([a, b], 1, set(), set())) == 1
 
     def test_recommend_falls_back_to_name_when_artist_page_unparseable(self, rec_yt):
         def get_artist(channel_id):
@@ -641,3 +693,7 @@ class TestRecommendations:
         rec_yt.get_artist.assert_any_call("UCofficial")
         assert data["artists_considered"] == ["Kendrick Lamar"]
         assert data["novedades"]
+
+    def test_call_recommend_requires_playlist_id(self, rec_yt):
+        result = asyncio.run(server.call_tool("recommend_for_playlist", {}))
+        assert "error" in json.loads(result[0].text)
