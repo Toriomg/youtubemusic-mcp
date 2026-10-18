@@ -1046,7 +1046,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="create_playlist_from_songs",
-        description="Create a new YouTube Music playlist and add songs to it by search query.",
+        description="Create a new YouTube Music playlist and add songs to it by search query. WRITES to the user's account: only call after showing the exact song list and getting explicit user confirmation.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -1089,7 +1089,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="add_songs_to_playlist",
-        description="Add songs to an existing playlist by search queries.",
+        description="Add songs to an existing playlist by search queries. WRITES to the user's account: only call after showing the exact song list and getting explicit user confirmation.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -1108,7 +1108,8 @@ TOOLS: list[Tool] = [
         description=(
             "Agentic multi-step playlist builder. Matches your mood/genre to real YouTube Music categories, "
             "samples tracks, applies energy filtering, and optionally saves as a playlist. "
-            "Steps: fetch categories → match mood → pull playlists → sample tracks → energy filter → (optional) save."
+            "Steps: fetch categories → match mood → pull playlists → sample tracks → energy filter → (optional) save. "
+            "save_playlist=true WRITES to the user's account: only call after showing the exact song list and getting explicit user confirmation."
         ),
         inputSchema={
             "type": "object",
@@ -1454,7 +1455,7 @@ async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptRe
                             "3. Use `get_recommendations` to get a seed list\n"
                             "4. Use `find_similar_songs` on 2-3 of my favourite tracks\n"
                             "5. Compile a 20-song Weekly Discovery Mix playlist\n"
-                            "6. Use `create_playlist_from_songs` to save it as 'Weekly Discovery — [date]'\n\n"
+                            "6. Show me the final list and ask before saving it with `create_playlist_from_songs` as 'Weekly Discovery — [date]'\n\n"
                             "Show me each step's reasoning as you go."
                         ),
                     ),
@@ -1506,7 +1507,7 @@ async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptRe
                             f"3. Use `find_similar_songs` on their most iconic song to find similar artists\n"
                             "4. Check if any of their songs are in my library using `get_library_stats`\n"
                             "5. Give me a curated listening plan: 'Start here → then this → then explore'\n"
-                            f"6. Create a '{artist} Deep Dive' playlist with their essential tracks\n\n"
+                            f"6. Propose a '{artist} Deep Dive' playlist and ask me before creating it\n\n"
                             "I want to understand their artistry, not just list songs."
                         ),
                     ),
