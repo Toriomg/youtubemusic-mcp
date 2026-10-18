@@ -22,6 +22,7 @@ import os
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -773,6 +774,9 @@ async def tool_get_listening_insights() -> list[TextContent]:
 
 # ── Recommendation helpers ─────────────────────
 
+# YouTube answers HTTP 429 when ~20 artists are fetched at once; keep parallelism low.
+_YT_POOL = ThreadPoolExecutor(max_workers=3)
+
 _VARIANT_RE = re.compile(r"\b(live|remix(ed)?|sped[\s-]?up|slowed|reverb|nightcore)\b", re.IGNORECASE)
 
 
@@ -885,29 +889,36 @@ async def tool_recommend_for_playlist(
     tracks = playlist.get("tracks", [])
 
     artist_counts: Counter = Counter()
+    artist_names: dict[str, str] = {}
     for t in tracks:
         first = (t.get("artists") or [{}])[0]
         if isinstance(first, dict) and first.get("id"):
             artist_counts[first["id"]] += 1
+            artist_names[first["id"]] = first.get("name") or ""
     # ponytail: caps artists to bound API calls (~3 + releases per artist); raise max_artists for big playlists
     artist_ids = [a for a, _ in artist_counts.most_common(max_artists)]
     known = _known_tracks(yt)
 
     def fetch(channel_id: str) -> tuple[str, list[dict], list[dict]]:
+        name = artist_names.get(channel_id) or channel_id
         try:
-            data = yt.get_artist(channel_id)
+            try:
+                data = yt.get_artist(channel_id)
+            except KeyError:
+                # Plain YouTube channels (not YT Music artist pages) fail to parse; retry by name.
+                data = yt.get_artist(_resolve_artist_id(yt, name))
             # Over-fetch hits: some get dropped below as variants / duplicates.
             return (
-                data.get("name", channel_id),
+                data.get("name", name),
                 _new_releases(yt, data, months),
                 _unheard_top_tracks(yt, data, hits_per_artist * 2, known),
             )
         except Exception as exc:
-            log.warning("Recommendation fetch failed for %s: %s", channel_id, exc)
-            return channel_id, [], []
+            log.warning("Recommendation fetch failed for %s (%s): %s", name, channel_id, exc)
+            return name, [], []
 
     loop = asyncio.get_running_loop()
-    results = await asyncio.gather(*[loop.run_in_executor(None, fetch, cid) for cid in artist_ids])
+    results = await asyncio.gather(*[loop.run_in_executor(_YT_POOL, fetch, cid) for cid in artist_ids])
 
     in_playlist = [_song_to_dict(t) for t in tracks]
     seen_ids = {s["videoId"] for s in in_playlist if s["videoId"]}

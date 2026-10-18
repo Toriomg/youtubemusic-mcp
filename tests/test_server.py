@@ -627,3 +627,17 @@ class TestRecommendations:
     def test_call_recommend_requires_playlist_id(self, rec_yt):
         result = asyncio.run(server.call_tool("recommend_for_playlist", {}))
         assert "error" in json.loads(result[0].text)
+
+    def test_recommend_falls_back_to_name_when_artist_page_unparseable(self, rec_yt):
+        def get_artist(channel_id):
+            if channel_id == "UCkendrick":
+                raise KeyError("musicImmersiveHeaderRenderer")
+            return MOCK_ARTIST
+
+        rec_yt.get_artist.side_effect = get_artist
+        rec_yt.search.return_value = [{"resultType": "artist", "artist": "Kendrick Lamar", "browseId": "UCofficial"}]
+        result = asyncio.run(server.tool_recommend_for_playlist("PLkendrick"))
+        data = json.loads(result[0].text)
+        rec_yt.get_artist.assert_any_call("UCofficial")
+        assert data["artists_considered"] == ["Kendrick Lamar"]
+        assert data["novedades"]
