@@ -1028,6 +1028,112 @@ async def tool_recommend_for_playlist(
     })
 
 
+# ── Proposals playlist cycle ───────────────────
+# recommend → fill "<title> - propuestas" → user likes songs on their phone → review → apply.
+
+_PROPOSALS_SUFFIX = " - propuestas"
+
+
+def _playlist_title(yt: YTMusic, playlist_id: str) -> str:
+    for pl in _get_library_playlists_cached():
+        if pl.get("playlistId") == playlist_id:
+            return pl.get("title") or playlist_id
+    return yt.get_playlist(playlist_id, limit=1).get("title") or playlist_id
+
+
+def _find_proposals(yt: YTMusic, playlist_id: str) -> tuple[str, str | None]:
+    """(proposals title, proposals playlistId or None if it doesn't exist yet)."""
+    title = _playlist_title(yt, playlist_id) + _PROPOSALS_SUFFIX
+    found = next((p["playlistId"] for p in _get_library_playlists_cached() if p.get("title") == title), None)
+    return title, found
+
+
+def _empty_playlist(yt: YTMusic, playlist_id: str, tracks: list[dict]) -> None:
+    items = [t for t in tracks if t.get("videoId") and t.get("setVideoId")]
+    if items:
+        yt.remove_playlist_items(playlist_id, items)
+
+
+def _review(yt: YTMusic, playlist_id: str) -> tuple[str, list[dict], list[dict], list[dict]]:
+    """(proposals id, proposals tracks, liked → add, rest → discard)."""
+    title, proposals_id = _find_proposals(yt, playlist_id)
+    if not proposals_id:
+        raise PlaylistError(f'There is no "{title}" playlist yet. Use fill_proposals_playlist first.')
+    tracks = yt.get_playlist(proposals_id, limit=None).get("tracks", [])
+    in_source = {t.get("videoId") for t in yt.get_playlist(playlist_id, limit=None).get("tracks", [])}
+    liked = [t for t in tracks if t.get("likeStatus") == "LIKE"]
+    to_add = [_song_to_dict(t) for t in liked if t.get("videoId") not in in_source]
+    to_discard = [_song_to_dict(t) for t in tracks if t.get("likeStatus") != "LIKE"]
+    return proposals_id, tracks, to_add, to_discard
+
+
+async def tool_fill_proposals_playlist(playlist_id: str, video_ids: list[str]) -> list[TextContent]:
+    yt = get_yt()
+    title, proposals_id = _find_proposals(yt, playlist_id)
+    try:
+        if proposals_id:
+            _empty_playlist(yt, proposals_id, yt.get_playlist(proposals_id, limit=None).get("tracks", []))
+            yt.add_playlist_items(proposals_id, video_ids, duplicates=False)
+            created = False
+        else:
+            result = yt.create_playlist(
+                title, f"Propuestas para {_playlist_title(yt, playlist_id)} (YouTube Music MCP)",
+                privacy_status="PRIVATE", video_ids=video_ids,
+            )
+            if not isinstance(result, str):
+                raise PlaylistError(f"create_playlist returned {result}")
+            proposals_id, created = result, True
+            _cache_invalidate("library_playlists")
+    except PlaylistError:
+        raise
+    except Exception as exc:
+        raise PlaylistError(f"Failed to fill {title}: {exc}") from exc
+    _cache_invalidate("known_tracks")
+    return _json_response({
+        "success": True,
+        "proposalsPlaylistId": proposals_id,
+        "title": title,
+        "created": created,
+        "songs": len(video_ids),
+    })
+
+
+async def tool_review_proposals(playlist_id: str) -> list[TextContent]:
+    yt = get_yt()
+    proposals_id, tracks, to_add, to_discard = _review(yt, playlist_id)
+    return _json_response({
+        "proposalsPlaylistId": proposals_id,
+        "total": len(tracks),
+        "to_add": to_add,
+        "to_discard": to_discard,
+    })
+
+
+async def tool_apply_proposals_review(
+    playlist_id: str, add_video_ids: list[str], discard_video_ids: list[str]
+) -> list[TextContent]:
+    yt = get_yt()
+    proposals_id, tracks, _, _ = _review(yt, playlist_id)
+    by_id = {t.get("videoId"): t for t in tracks}
+    try:
+        if add_video_ids:
+            yt.add_playlist_items(playlist_id, add_video_ids, duplicates=False)
+        discards = json.loads(_DISCARDS_PATH.read_text()) if _DISCARDS_PATH.exists() else []
+        already = {d.get("videoId") for d in discards}
+        new = [_song_to_dict(by_id[v]) for v in discard_video_ids if v in by_id and v not in already]
+        _DISCARDS_PATH.write_text(json.dumps(discards + new, ensure_ascii=False, indent=1))
+        _empty_playlist(yt, proposals_id, tracks)
+    except Exception as exc:
+        raise PlaylistError(f"Failed to apply review: {exc}") from exc
+    _cache_invalidate("known_tracks")
+    return _json_response({
+        "success": True,
+        "added": len(add_video_ids),
+        "discarded": len(new),
+        "proposals_emptied": True,
+    })
+
+
 async def tool_get_server_info() -> list[TextContent]:
     cached_songs = _cache_get("library_songs")
     lib_size = len(cached_songs) if cached_songs else None
@@ -1313,6 +1419,64 @@ TOOLS: list[Tool] = [
             "required": ["playlist_id"],
         },
     ),
+    Tool(
+        name="fill_proposals_playlist",
+        description=(
+            "Step 2 of the proposals cycle (after recommend_for_playlist). Puts the given songs into the "
+            "private playlist '<playlist title> - propuestas', creating it if needed; if it already exists "
+            "it is EMPTIED first and refilled. The user then listens on their phone and likes the songs "
+            "they want to keep. WRITES to the user's account: only call after showing the exact song list "
+            "and getting explicit user confirmation."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "playlist_id": {"type": "string", "description": "The SOURCE playlist the proposals are for"},
+                "video_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "videoIds to propose (from recommend_for_playlist)",
+                },
+            },
+            "required": ["playlist_id", "video_ids"],
+        },
+    ),
+    Tool(
+        name="review_proposals",
+        description=(
+            "Read-only. Step 3 of the proposals cycle: looks at '<playlist title> - propuestas' and splits "
+            "it into 'to_add' (songs the user liked, not yet in the source playlist) and 'to_discard' "
+            "(everything not liked). Show both lists to the user before apply_proposals_review."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"playlist_id": {"type": "string", "description": "The SOURCE playlist"}},
+            "required": ["playlist_id"],
+        },
+    ),
+    Tool(
+        name="apply_proposals_review",
+        description=(
+            "Step 4 of the proposals cycle: adds add_video_ids to the source playlist, records "
+            "discard_video_ids in the local discard list (they are never recommended again), and empties "
+            "the proposals playlist. Pass exactly the lists from review_proposals that the user confirmed. "
+            "WRITES to the user's account: only call after showing the exact song lists and getting "
+            "explicit user confirmation."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "playlist_id": {"type": "string", "description": "The SOURCE playlist"},
+                "add_video_ids": {"type": "array", "items": {"type": "string"}, "description": "Songs to add"},
+                "discard_video_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Songs to discard",
+                },
+            },
+            "required": ["playlist_id", "add_video_ids", "discard_video_ids"],
+        },
+    ),
 ]
 
 
@@ -1394,6 +1558,24 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     args["playlist_id"], int(args.get("months", 12)), int(args.get("max_novedades", 12)),
                     int(args.get("max_hits", 12)), bool(args.get("include_variants", False)),
                     int(args.get("max_artists", 20)),
+                )
+            case "fill_proposals_playlist":
+                if not args.get("playlist_id"):
+                    raise ValueError("playlist_id is required")
+                if not isinstance(args.get("video_ids"), list) or not args["video_ids"]:
+                    raise ValueError("video_ids must be a non-empty list")
+                return await tool_fill_proposals_playlist(args["playlist_id"], args["video_ids"])
+            case "review_proposals":
+                if not args.get("playlist_id"):
+                    raise ValueError("playlist_id is required")
+                return await tool_review_proposals(args["playlist_id"])
+            case "apply_proposals_review":
+                if not args.get("playlist_id"):
+                    raise ValueError("playlist_id is required")
+                if not isinstance(args.get("add_video_ids"), list) or not isinstance(args.get("discard_video_ids"), list):
+                    raise ValueError("add_video_ids and discard_video_ids must be lists")
+                return await tool_apply_proposals_review(
+                    args["playlist_id"], args["add_video_ids"], args["discard_video_ids"]
                 )
             case _:
                 raise ValueError(f"Unknown tool: {name}")

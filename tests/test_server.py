@@ -697,3 +697,79 @@ class TestRecommendations:
     def test_call_recommend_requires_playlist_id(self, rec_yt):
         result = asyncio.run(server.call_tool("recommend_for_playlist", {}))
         assert "error" in json.loads(result[0].text)
+
+
+# ─────────────────────────────────────────────
+# Proposals playlist cycle
+# ─────────────────────────────────────────────
+
+PROPOSALS = [
+    {**song("Liked One", "vidLiked"), "likeStatus": "LIKE", "setVideoId": "set1"},
+    {**song("Liked Already There", "vidThere"), "likeStatus": "LIKE", "setVideoId": "set2"},
+    {**song("Meh", "vidMeh"), "likeStatus": "INDIFFERENT", "setVideoId": "set3"},
+    {**song("Nope", "vidNope"), "likeStatus": "DISLIKE", "setVideoId": "set4"},
+]
+
+
+@pytest.fixture
+def prop_yt(mock_yt, tmp_path, monkeypatch):
+    mock_yt.get_library_playlists.return_value = MOCK_PLAYLISTS + [
+        {"title": "Rap Favourites - propuestas", "playlistId": "PLprops", "count": 4},
+    ]
+    playlists = {
+        "PLrandom1": {"title": "Rap Favourites", "tracks": [song("Liked Already There", "vidThere")]},
+        "PLprops": {"title": "Rap Favourites - propuestas", "tracks": PROPOSALS},
+    }
+    mock_yt.get_playlist.side_effect = lambda playlist_id, limit=None: playlists[playlist_id]
+    monkeypatch.setattr(server, "_DISCARDS_PATH", tmp_path / "descartes.json")
+    return mock_yt
+
+
+class TestProposals:
+    def test_fill_creates_private_playlist_when_missing(self, mock_yt):
+        mock_yt.get_playlist.return_value = {"title": "Rap Favourites", "tracks": []}
+        result = asyncio.run(server.tool_fill_proposals_playlist("PLrandom1", ["v1", "v2"]))
+        data = json.loads(result[0].text)
+        assert data["created"] is True and data["title"] == "Rap Favourites - propuestas"
+        args, kwargs = mock_yt.create_playlist.call_args
+        assert args[0] == "Rap Favourites - propuestas"
+        assert kwargs["privacy_status"] == "PRIVATE" and kwargs["video_ids"] == ["v1", "v2"]
+
+    def test_fill_empties_existing_then_adds(self, prop_yt):
+        result = asyncio.run(server.tool_fill_proposals_playlist("PLrandom1", ["v1"]))
+        data = json.loads(result[0].text)
+        assert data["created"] is False and data["proposalsPlaylistId"] == "PLprops"
+        prop_yt.remove_playlist_items.assert_called_once_with("PLprops", PROPOSALS)
+        prop_yt.add_playlist_items.assert_called_once_with("PLprops", ["v1"], duplicates=False)
+        prop_yt.create_playlist.assert_not_called()
+
+    def test_review_splits_liked_and_rest_without_writing(self, prop_yt):
+        result = asyncio.run(server.tool_review_proposals("PLrandom1"))
+        data = json.loads(result[0].text)
+        assert [s["videoId"] for s in data["to_add"]] == ["vidLiked"]  # vidThere is already in the playlist
+        assert [s["videoId"] for s in data["to_discard"]] == ["vidMeh", "vidNope"]
+        prop_yt.add_playlist_items.assert_not_called()
+        prop_yt.remove_playlist_items.assert_not_called()
+
+    def test_review_without_proposals_playlist_errors(self, mock_yt):
+        result = asyncio.run(server.call_tool("review_proposals", {"playlist_id": "PLrandom1"}))
+        assert json.loads(result[0].text)["error_type"] == "PlaylistError"
+
+    def test_apply_adds_discards_and_empties(self, prop_yt):
+        server._DISCARDS_PATH.write_text(json.dumps([{"title": "Nope", "artist": "Kendrick Lamar", "videoId": "vidNope"}]))
+        result = asyncio.run(server.tool_apply_proposals_review("PLrandom1", ["vidLiked"], ["vidMeh", "vidNope"]))
+        data = json.loads(result[0].text)
+        prop_yt.add_playlist_items.assert_called_once_with("PLrandom1", ["vidLiked"], duplicates=False)
+        prop_yt.remove_playlist_items.assert_called_once_with("PLprops", PROPOSALS)
+        discards = json.loads(server._DISCARDS_PATH.read_text())
+        assert [d["videoId"] for d in discards] == ["vidNope", "vidMeh"]  # no duplicates
+        assert data["discarded"] == 1
+
+    def test_discarded_songs_are_not_recommended_again(self, prop_yt):
+        server._DISCARDS_PATH.write_text(json.dumps([{"title": "Meh", "artist": "Kendrick Lamar", "videoId": "vidMeh"}]))
+        ids, keys = server._known_tracks(prop_yt)
+        assert "vidMeh" in ids
+
+    def test_fill_requires_video_ids(self, mock_yt):
+        result = asyncio.run(server.call_tool("fill_proposals_playlist", {"playlist_id": "PLrandom1", "video_ids": []}))
+        assert "error" in json.loads(result[0].text)
