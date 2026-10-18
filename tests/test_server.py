@@ -787,3 +787,27 @@ class TestProposals:
     def test_fill_requires_video_ids(self, mock_yt):
         result = asyncio.run(server.call_tool("fill_proposals_playlist", {"playlist_id": "PLrandom1", "video_ids": []}))
         assert "error" in json.loads(result[0].text)
+
+    def test_discard_songs_writes_local_file_only(self, prop_yt):
+        songs = [
+            {"title": "PARADIXE", "artists": ["Feid", "Pirlo"], "videoId": "vidPara"},
+            {"title": "PARADIXE", "artists": ["Feid", "Pirlo"], "videoId": "vidPara"},  # duplicate in input
+            {"title": "LUNA", "artist": "Feid", "videoId": "vidLuna"},
+        ]
+        data = json.loads(asyncio.run(server.tool_discard_songs(songs))[0].text)
+        assert data == {"success": True, "discarded": 2, "already_discarded": 1}
+        again = json.loads(asyncio.run(server.tool_discard_songs(songs[2:]))[0].text)
+        assert again["discarded"] == 0
+        stored = json.loads(server._DISCARDS_PATH.read_text())
+        assert [d["videoId"] for d in stored] == ["vidPara", "vidLuna"]
+        assert stored[1]["artists"] == ["Feid"]
+        # The music video version by the featured artist now counts as known too.
+        ids, keys = server._known_tracks(prop_yt)
+        assert server._track_keys({"title": "PARADIXE - Pirlo (Video Oficial)", "artist": "Pirlo"}) & keys
+        prop_yt.add_playlist_items.assert_not_called()
+        prop_yt.remove_playlist_items.assert_not_called()
+
+    def test_discard_songs_validates_input(self, mock_yt):
+        for args in ({}, {"songs": []}, {"songs": [{"title": "no id"}]}):
+            result = asyncio.run(server.call_tool("discard_songs", args))
+            assert "error" in json.loads(result[0].text)

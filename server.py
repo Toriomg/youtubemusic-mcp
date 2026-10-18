@@ -1072,6 +1072,17 @@ def _empty_playlist(yt: YTMusic, playlist_id: str, tracks: list[dict]) -> None:
         yt.remove_playlist_items(playlist_id, items)
 
 
+def _add_discards(songs: list[dict]) -> int:
+    """Append songs (normalized dicts) to descartes.json, skipping ones already there. Returns how many."""
+    discards = json.loads(_DISCARDS_PATH.read_text()) if _DISCARDS_PATH.exists() else []
+    already = {d.get("videoId") for d in discards}
+    new = [s for s in songs if s.get("videoId") and s["videoId"] not in already]
+    new = list({s["videoId"]: s for s in new}.values())
+    _DISCARDS_PATH.write_text(json.dumps(discards + new, ensure_ascii=False, indent=1))
+    _cache_invalidate("known_tracks")
+    return len(new)
+
+
 def _review(yt: YTMusic, playlist_id: str) -> tuple[str, list[dict], list[dict], list[dict]]:
     """(proposals id, proposals tracks, liked → add, rest → discard)."""
     title, proposals_id = _find_proposals(yt, playlist_id)
@@ -1136,10 +1147,7 @@ async def tool_apply_proposals_review(
     try:
         if add_video_ids:
             yt.add_playlist_items(playlist_id, add_video_ids, duplicates=False)
-        discards = json.loads(_DISCARDS_PATH.read_text()) if _DISCARDS_PATH.exists() else []
-        already = {d.get("videoId") for d in discards}
-        new = [_rec_song(by_id[v]) for v in discard_video_ids if v in by_id and v not in already]
-        _DISCARDS_PATH.write_text(json.dumps(discards + new, ensure_ascii=False, indent=1))
+        discarded = _add_discards([_rec_song(by_id[v]) for v in discard_video_ids if v in by_id])
         _empty_playlist(yt, proposals_id, tracks)
     except Exception as exc:
         raise PlaylistError(f"Failed to apply review: {exc}") from exc
@@ -1147,9 +1155,28 @@ async def tool_apply_proposals_review(
     return _json_response({
         "success": True,
         "added": len(add_video_ids),
-        "discarded": len(new),
+        "discarded": discarded,
         "proposals_emptied": True,
     })
+
+
+async def tool_discard_songs(songs: list[dict]) -> list[TextContent]:
+    for song in songs:
+        if not isinstance(song, dict) or not song.get("videoId") or not song.get("title"):
+            raise ValueError("each song needs at least videoId and title")
+    clean = [
+        {
+            "title": song["title"],
+            "artist": song.get("artist") or (song.get("artists") or [None])[0],
+            "artists": song.get("artists") or ([song["artist"]] if song.get("artist") else []),
+            "album": song.get("album"),
+            "videoId": song["videoId"],
+            "duration": song.get("duration"),
+        }
+        for song in songs
+    ]
+    added = _add_discards(clean)
+    return _json_response({"success": True, "discarded": added, "already_discarded": len(clean) - added})
 
 
 async def tool_get_server_info() -> list[TextContent]:
@@ -1495,6 +1522,38 @@ TOOLS: list[Tool] = [
             "required": ["playlist_id", "add_video_ids", "discard_video_ids"],
         },
     ),
+    Tool(
+        name="discard_songs",
+        description=(
+            "Mark songs as discarded so they are never recommended again, e.g. when the user says "
+            "'I already know these' or 'I don't want these' about songs from recommend_for_playlist. "
+            "Pass the song objects as returned by recommend_for_playlist (title, artist(s) and videoId are "
+            "what matter: matching also catches other versions of the same song, like its music video). "
+            "Only writes the local descartes.json file; it does NOT touch the YouTube Music account. "
+            "Confirm the exact list with the user before calling it."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "songs": {
+                    "type": "array",
+                    "description": "Songs to discard",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "videoId": {"type": "string"},
+                            "title": {"type": "string"},
+                            "artist": {"type": "string"},
+                            "artists": {"type": "array", "items": {"type": "string"}},
+                            "album": {"type": "string"},
+                        },
+                        "required": ["videoId", "title"],
+                    },
+                },
+            },
+            "required": ["songs"],
+        },
+    ),
 ]
 
 
@@ -1595,6 +1654,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 return await tool_apply_proposals_review(
                     args["playlist_id"], args["add_video_ids"], args["discard_video_ids"]
                 )
+            case "discard_songs":
+                if not isinstance(args.get("songs"), list) or not args["songs"]:
+                    raise ValueError("songs must be a non-empty list")
+                return await tool_discard_songs(args["songs"])
             case _:
                 raise ValueError(f"Unknown tool: {name}")
 
