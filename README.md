@@ -2,280 +2,246 @@
 
 <div align="center">
 
-A production-grade Model Context Protocol (MCP) server that connects YouTube Music to AI assistants like Claude.  
-Implements the full MCP primitive set — **Tools, Resources, and Prompts** — for genuine agentic music experiences.
+A Model Context Protocol (MCP) server that connects YouTube Music to AI assistants like Claude,
+with a focus on **recommending songs for your existing playlists**.
+Implements Tools, Resources and Prompts.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
-![MCP](https://img.shields.io/badge/MCP-1.0-purple.svg)
-![Tests](https://img.shields.io/badge/tests-51%20passing-brightgreen.svg)
-![CI](https://github.com/codeRisshi25/youtubemusic-mcp/actions/workflows/ci.yml/badge.svg)
+![MCP](https://img.shields.io/badge/MCP-1.x-purple.svg)
+![Tests](https://img.shields.io/badge/tests-75%20passing-brightgreen.svg)
+![CI](https://github.com/Toriomg/youtubemusic-mcp/actions/workflows/ci.yml/badge.svg)
 
-[Architecture](#architecture) • [Features](#features) • [Installation](#installation) • [Authentication](#authentication) • [Usage](#usage) • [Tools](#tools) • [Resources](#resources) • [Prompts](#prompts)
+[Recommendations](#recommendations) • [Tools](#tools) • [Installation](#installation) • [Authentication](#authentication) • [Usage](#usage) • [Safety](#safety) • [Troubleshooting](#troubleshooting)
 
 </div>
 
 ---
 
-## Architecture
+## Recommendations
+
+`recommend_for_playlist` looks at the artists already in a playlist (most frequent first) and
+returns two separate lists:
+
+- **`novedades`**: songs from those artists' releases in the last 12 months. Every track of a
+  single, only the 2 most played tracks of an album or EP.
+- **`hits_que_no_conoces`**: the artists' most popular songs that you don't know yet.
+
+Every recommended song:
+
+- is **unknown to you**: not in your library, liked songs, history, any of your playlists, or
+  your local discard list (`descartes.json`). Music video and audio versions of the same song
+  count as the same song;
+- has the playlist's artist **credited** (collaborations count, unrelated artists on the same
+  page don't);
+- is **not a live, sped up, slowed, reverb, nightcore or clean / radio edit version**, unless you
+  ask for them (`include_variants=true`). Remixes are kept;
+- appears **only once**, picked round-robin across artists (12 + 12 by default).
+
+`get_artist_new_releases` and `get_unheard_top_tracks` do the same for a single artist.
+
+### Proposals cycle
+
+Instead of adding recommendations straight to your playlist, they go to a private
+`<playlist> - propuestas` playlist that you listen to on your phone:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    Claude / AI Assistant                   │
-└──────────────────────┬─────────────────────────────────────┘
-                       │  Model Context Protocol (stdio)
-┌──────────────────────▼─────────────────────────────────────┐
-│                 YouTube Music MCP Server v2                │
-│                                                            │
-│  ┌─────────────┐  ┌───────────────┐  ┌──────────────────┐  │
-│  │  15 Tools   │  │  3 Resources  │  │    3 Prompts     │  │
-│  │             │  │               │  │                  │  │
-│  │ search      │  │library://     │  │weekly-discovery  │  │
-│  │ stats       │  │  songs        │  │mood-based-       │  │
-│  │ similar ★   │  │  artists      │  │  playlist        │  │
-│  │ recommend ★ │  │  playlists    │  │artist-deep-dive  │  │
-│  │ smart pl ★  │  └───────────────┘  └──────────────────┘  │
-│  │ charts      │                                           │
-│  │ insights    │  ┌───────────────────────────────────┐    │
-│  │ moods       │  │  TTL Cache (5 min)  •  Async ★    │    │
-│  │ ...         │  │  Custom Exceptions  •  Logging    │    │
-│  └─────────────┘  └───────────────────────────────────┘    │
-└──────────────────────┬─────────────────────────────────────┘
-                       │  ytmusicapi
-┌──────────────────────▼─────────────────────────────────────┐
-│                   YouTube Music API                        │
-└────────────────────────────────────────────────────────────┘
-★ = Agentic / async feature
+1. recommend_for_playlist   → you check the list and say "yes"
+2. fill_proposals_playlist  → empties and refills "<playlist> - propuestas" (private)
+3. You listen and like the songs you want to keep
+4. review_proposals         → liked songs go to the playlist, the rest to the discard list
+5. apply_proposals_review   → after your "yes": adds the liked ones, records the discards,
+                              empties the proposals playlist
 ```
+
+Songs you already know can be discarded directly with `discard_songs`. Discarded songs are
+never recommended again. The list lives only on your machine, in `descartes.json` (gitignored);
+it's plain JSON, so you can edit it by hand to undo a discard.
 
 ---
 
-## Features
+## Tools
 
-**15 Tools · 3 Resources · 3 Prompts — full MCP primitive coverage:**
+**22 Tools · 3 Resources · 3 Prompts.** ✏️ = writes to your YouTube Music account (see [Safety](#safety)).
 
-### 🛠️ Tools
+### Recommendations
 
-| Tool                         | Description                                                     |
-| ---------------------------- | --------------------------------------------------------------- |
-| `get_liked_songs_count`      | Total song count (bypasses YT display limit)                    |
-| `get_library_stats`          | Songs, artists, playlists + detailed breakdown                  |
-| `search_music`               | Search with type filter (songs/albums/artists/playlists/videos) |
-| `get_top_artists`            | Ranked artists with visual progress bars                        |
-| `find_similar_songs` ⭐      | **Real** YTMusic radio engine — not a fake artist search        |
-| `get_recommendations` ⭐     | Async-parallel fetch across top 5 artists                       |
-| `create_playlist_from_songs` | Create & populate playlist from search queries                  |
-| `list_playlists`             | All your playlists with IDs and song counts                     |
-| `get_playlist_songs`         | Browse songs in any playlist                                    |
-| `add_songs_to_playlist`      | Add songs to existing playlist                                  |
-| `build_smart_playlist` ⭐    | **Agentic** 6-step pipeline: mood→category→tracks→filter→save   |
-| `explore_moods`              | Discover all YTMusic Moods & Genres categories                  |
-| `get_charts`                 | Global or country-specific trending charts                      |
-| `get_listening_insights`     | History analysis: patterns, diversity score, insights           |
-| `get_server_info`            | Auth method, cache state, version, capabilities                 |
+| Tool                        | Description                                                           |
+| --------------------------- | --------------------------------------------------------------------- |
+| `recommend_for_playlist`    | Novedades + unknown hits for a playlist's artists                     |
+| `get_artist_new_releases`   | An artist's singles and albums from the last N months, with tracks    |
+| `get_unheard_top_tracks`    | An artist's top songs minus the ones you already know                 |
+| `fill_proposals_playlist` ✏️ | Empty and refill `<playlist> - propuestas` with the chosen songs      |
+| `review_proposals`          | Split the proposals playlist into liked (add) and the rest (discard)  |
+| `apply_proposals_review` ✏️  | Add the liked songs, record discards, empty the proposals playlist    |
+| `discard_songs`             | Never recommend these songs again (local file only)                   |
 
-### 📦 Resources (passively readable by Claude)
+### Library, search and discovery
 
-| Resource URI          | Description                      |
-| --------------------- | -------------------------------- |
-| `library://songs`     | Full library as structured JSON  |
-| `library://artists`   | Artist rankings with percentages |
-| `library://playlists` | All playlists as structured JSON |
+| Tool                           | Description                                                      |
+| ------------------------------ | ---------------------------------------------------------------- |
+| `get_liked_songs_count`        | Total song count in your library                                 |
+| `get_library_stats`            | Songs, artists, playlists + optional breakdown                   |
+| `search_music`                 | Search songs, albums, artists, playlists or videos               |
+| `get_top_artists`              | Your artists ranked by song count                                |
+| `find_similar_songs`           | Similar tracks via YouTube Music's radio                         |
+| `get_recommendations`          | Songs from your top 5 library artists                            |
+| `list_playlists`               | Your playlists with IDs and song counts                          |
+| `get_playlist_songs`           | Songs in a playlist                                              |
+| `explore_moods`                | YouTube Music's Moods & Genres categories                        |
+| `get_charts`                   | Global or per-country charts                                     |
+| `get_listening_insights`       | Patterns in your listening history                               |
+| `get_server_info`              | Auth method, cache state, version                                |
+| `create_playlist_from_songs` ✏️ | Create a playlist from song search queries                       |
+| `add_songs_to_playlist` ✏️      | Add songs to a playlist by search queries                        |
+| `build_smart_playlist` ✏️       | Mood/genre playlist builder; writes only with `save_playlist=true` |
 
-### 💬 Prompts (guided conversation starters)
+### Resources and prompts
+
+| Resource              | Description                     |
+| --------------------- | ------------------------------- |
+| `library://songs`     | Full library as JSON            |
+| `library://artists`   | Artist rankings                 |
+| `library://playlists` | All playlists                   |
 
 | Prompt                 | Description                              |
 | ---------------------- | ---------------------------------------- |
-| `weekly-discovery-mix` | Guided weekly music discovery workflow   |
-| `mood-based-playlist`  | Collaborative mood → playlist session    |
-| `artist-deep-dive`     | Full artist exploration + listening plan |
+| `weekly-discovery-mix` | Guided weekly discovery workflow         |
+| `mood-based-playlist`  | Mood → playlist session                  |
+| `artist-deep-dive`     | Artist exploration + listening plan      |
 
 ---
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.10 or higher
-- A YouTube Music account
-- Browser developer tools access (for authentication)
-
-### Setup
-
-1. **Clone the repository**
+Requires [uv](https://docs.astral.sh/uv/) and a YouTube Music account.
 
 ```bash
-git clone https://github.com/codeRisshi25/youtubemusic-mcp.git
+gh repo clone Toriomg/youtubemusic-mcp
 cd youtubemusic-mcp
-```
-
-2. **Create virtual environment**
-
-```bash
-python3 -m venv venv
-source venv/bin/activate  # Linux/macOS
-# OR
-venv\Scripts\activate     # Windows
-```
-
-3. **Install dependencies**
-
-```bash
-pip install -e .
+uv sync
 ```
 
 ---
 
 ## Authentication
 
-Choose one authentication method:
+### Option A: cookie file (simplest)
 
-### Option A: Cookie File (Simplest — recommended)
-
-1. Visit [music.youtube.com](https://music.youtube.com) and log in
-2. Open Developer Tools (`F12`)
-3. Go to **Network** tab and refresh the page
-4. Click any request → **Headers** → copy the full `cookie:` value
-5. Paste it into a file named `cookie.txt` in the project directory
-6. **Done!** The server auto-generates `browser.json` on first startup
+1. Open [music.youtube.com](https://music.youtube.com) and log in. If several Google accounts are
+   signed in, a private window with only the right one avoids mix-ups.
+2. Open the developer tools (`F12`) → **Network**, enable the **XHR** filter and reload.
+3. Click a `browse` or `account_menu` request to `music.youtube.com` →
+   **Headers** → **Request headers**. In Firefox, toggle **Raw** to see the whole line.
+4. Copy the full value after `Cookie:` (it must contain `SAPISID=`).
+5. Paste it, on a single line, into `cookie.txt` in the project directory.
+6. Check it works:
 
 ```bash
-# Optional: validate cookies before starting the server
-python update_auth.py
+uv run update_auth.py
 ```
 
-**Note:** Cookies typically last 6–24 months. When they expire, just paste fresh cookies into `cookie.txt` and restart.
+The server regenerates `browser.json` (permissions `600`) from `cookie.txt` on every start.
+Cookies last a few months; when they expire, paste fresh ones into `cookie.txt`.
+If you used a private window, close it **without logging out**, or the cookie stops working.
 
-### Option B: OAuth (Long-term)
+#### Several Google accounts in the cookie
 
-See [docs/OAUTH_SETUP.md](docs/OAUTH_SETUP.md) for complete OAuth setup instructions.
+The cookie includes every account signed in to the browser, and the server uses the first one by
+default. To use another one, set `YTMUSIC_AUTHUSER` to its position (0, 1, 2…):
+
+```bash
+YTMUSIC_AUTHUSER=1 uv run update_auth.py
+```
+
+### Option B: OAuth
+
+See [docs/OAUTH_SETUP.md](docs/OAUTH_SETUP.md).
+
+`cookie.txt`, `browser.json`, `oauth.json` and `descartes.json` are in `.gitignore`. Never commit them.
 
 ---
 
 ## Usage
 
-### Test with MCP Inspector
+### Claude Code
 
 ```bash
-npx @modelcontextprotocol/inspector venv/bin/python server.py
+claude mcp add ytmusic -s user -- uv --directory /absolute/path/to/youtubemusic-mcp run server.py
+# with a non-default account:
+claude mcp add ytmusic -s user -e YTMUSIC_AUTHUSER=1 -- uv --directory /absolute/path/to/youtubemusic-mcp run server.py
 ```
 
-Opens web interface at `http://localhost:6274` to test all 15 tools, 3 resources, and 3 prompts.
+Restart Claude Code, then just ask, for example:
 
-### Claude Desktop Integration
+- "List my YouTube Music playlists"
+- "Recommend songs for my playlist X"
+- "What has Quevedo released this year?"
 
-1. **Config file location:**
-   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-   - Linux: `~/.config/Claude/claude_desktop_config.json`
+### Claude Desktop
 
-2. **Add configuration:**
+Add to `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`,
+Windows: `%APPDATA%\Claude\`, Linux: `~/.config/Claude/`):
 
 ```json
 {
   "mcpServers": {
     "youtube-music": {
-      "command": "/path/to/venv/bin/python",
-      "args": ["/path/to/server.py"]
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/youtubemusic-mcp", "run", "server.py"],
+      "env": { "YTMUSIC_AUTHUSER": "0" }
     }
   }
 }
 ```
 
-3. **Restart Claude Desktop**
+See [docs/CLAUDE_SETUP.md](docs/CLAUDE_SETUP.md) for details.
 
-See [docs/CLAUDE_SETUP.md](docs/CLAUDE_SETUP.md) for detailed instructions.
-
----
-
-## Available Tools
-
-See the [Features section](#features) above for a full table of all 15 tools.
-
-### Agentic Highlights
-
-**`build_smart_playlist`** — the centrepiece agentic tool. Runs a 6-step pipeline inside a single tool call:
-
-```
-Step 1: Fetch all Moods & Genres from YouTube Music
-Step 2: Match your mood keyword to a real category
-Step 3: Pull mood playlist pool from that category
-Step 4: Sample tracks across multiple playlists
-Step 5: Apply energy-level filter (high/medium/low)
-Step 6: Optionally create & save to YouTube Music
-```
-
-**`find_similar_songs`** — uses `get_watch_playlist(radio=True)`, the actual YTMusic similarity engine, not a fake artist search.
-
-**`get_recommendations`** — fetches from 5 artists using `asyncio.gather()` for true parallel execution.
-
----
-
-## Running Tests
+### MCP Inspector
 
 ```bash
-pip install -e ".[dev]"
-pytest tests/ -v
+npx @modelcontextprotocol/inspector uv run server.py
 ```
 
-51 tests covering auth, caching, all tools, resources, prompts, and routing — no network required (fully mocked).
+---
+
+## Safety
+
+No tool marked ✏️ may run until the assistant has shown you the exact list of changes (playlist
+name and every song) and you have said yes. Approval for one list doesn't cover the next. The rule
+is in [AGENTS.md](AGENTS.md) and in each write tool's description, which is what the model reads.
+
+All the recommendation tools only read. `discard_songs` only writes the local `descartes.json`.
+
+---
+
+## Development
+
+```bash
+uv sync --extra dev
+uv run pytest
+uv run ruff check server.py tests/
+```
+
+75 tests, fully mocked: no network or account needed. CI runs the same on Python 3.10–3.12.
 
 ---
 
 ## Troubleshooting
 
-### Authentication Errors
-
-If you get authentication errors after ~6 months:
-
-1. Your cookies have likely expired
-2. Follow the simple update process in [docs/AUTH_UPDATE.md](docs/AUTH_UPDATE.md)
-3. You'll just need to paste fresh cookies from your browser
-
-### Server Not Detected in Claude
-
-- Use absolute paths in `claude_desktop_config.json`
-- Restart Claude Desktop after config changes
-- Check logs in Claude → Help → View Logs
-
-### Import Errors
-
-- Ensure virtual environment is activated
-- Run `pip install -e .` in the project directory
-
-### Server Crashes on Startup
-
-- Verify `browser.json` or `oauth.json` exists
-- Check file permissions
-- See [docs/CLAUDE_SETUP.md](docs/CLAUDE_SETUP.md) for detailed troubleshooting
+- **The library or playlists come back empty.** The cookie is probably using another Google
+  account. Check `get_server_info`, or try `YTMUSIC_AUTHUSER=1`, `2`… (see above).
+- **`HTTP 429: Too Many Requests`.** YouTube throttled the requests. Wait a few minutes; the
+  server already limits itself to 3 parallel artist lookups.
+- **Authentication errors after a while.** The cookie expired: paste a fresh one into `cookie.txt`
+  ([docs/AUTH_UPDATE.md](docs/AUTH_UPDATE.md)).
+- **The server isn't detected.** Use absolute paths and restart the client after changing its config.
 
 ---
 
-## Contributing
+## Credits
 
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for contribution guidelines.
+Fork of [codeRisshi25/youtubemusic-mcp](https://github.com/codeRisshi25/youtubemusic-mcp).
+MIT License, see [LICENSE](LICENSE). Copyright (c) 2025 Risshi Raj Sen.
 
----
-
-## License
-
-MIT License - see [LICENSE](LICENSE)
-
-Copyright (c) 2025 Risshi Raj Sen
-
----
-
-## Links
-
-- [GitHub Issues](https://github.com/codeRisshi25/youtubemusic-mcp/issues)
-- [Discussions](https://github.com/codeRisshi25/youtubemusic-mcp/discussions)
-
----
-
-<div align="center">
-
-Built with [ytmusicapi](https://github.com/sigma67/ytmusicapi) • [MCP](https://modelcontextprotocol.io/)
-
-⭐ Star if useful!
-
-</div>
+Built with [ytmusicapi](https://github.com/sigma67/ytmusicapi) and [MCP](https://modelcontextprotocol.io/).
