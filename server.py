@@ -797,9 +797,27 @@ def _norm(text: str | None) -> str:
     return re.sub(r"\W+", "", (text or "").lower())
 
 
-def _track_key(song: dict) -> str:
-    """Loose identity for a normalized song, so audio and video versions match."""
-    return f"{_norm(song.get('title'))}|{_norm(song.get('artist'))}"
+_VIDEO_TAG_RE = re.compile(
+    r"[(\[][^)\]]*\b(video|v[ií]deo|oficial|official|visualizer|lyrics?|letra|audio)\b[^)\]]*[)\]]",
+    re.IGNORECASE,
+)
+
+
+def _track_keys(song: dict) -> set[str]:
+    """Loose identities of a song, one per credited artist, so that the audio track and its music
+    video match ("PARADIXE" by Feid & Pirlo == "PARADIXE" by Pirlo,
+    "TRATRATRA - ANMI, JUSEPH (Video Oficial)" == "TRATRATRA")."""
+    artists = [_norm(a) for a in song.get("artists") or [song.get("artist")] if _norm(a)]
+    title = _VIDEO_TAG_RE.sub("", song.get("title") or "")
+    if " - " in title:
+        # Music video titles often read "Artist - Title" or "Title - Artist, Artist".
+        left, right = title.split(" - ", 1)
+        if any(a in _norm(left) for a in artists):
+            title = right
+        elif any(a in _norm(right) for a in artists):
+            title = left
+    core = _norm(title)
+    return {f"{core}|{a}" for a in artists} or {f"{core}|"}
 
 
 def _rec_song(track: dict) -> dict:
@@ -883,12 +901,12 @@ def _known_tracks(yt: YTMusic) -> tuple[set[str], set[str]]:
             songs += yt.get_playlist(pl["playlistId"], limit=None).get("tracks", [])
         except Exception as exc:
             log.warning("Skipping playlist %s: %s", pl.get("title"), exc)
-    normalized = [_song_to_dict(s) for s in songs]
+    normalized = [_rec_song(s) for s in songs]
     if _DISCARDS_PATH.exists():
         normalized += json.loads(_DISCARDS_PATH.read_text())
     known = (
         {s["videoId"] for s in normalized if s.get("videoId")},
-        {_track_key(s) for s in normalized},
+        set().union(*(_track_keys(s) for s in normalized)),
     )
     _cache_set("known_tracks", known)
     return known
@@ -905,7 +923,7 @@ def _unheard_top_tracks(yt: YTMusic, artist: dict, limit: int, known: tuple[set[
     unheard = []
     for t in tracks:
         song = _rec_song(t)
-        if song["videoId"] in ids or _track_key(song) in keys:
+        if song["videoId"] in ids or _track_keys(song) & keys:
             continue
         unheard.append(song)
         if len(unheard) >= limit:
@@ -921,11 +939,11 @@ def _interleave(per_artist: list[list[dict]], cap: int, seen_ids: set[str], seen
         for queue in queues:
             while queue:
                 song = queue.pop(0)
-                key = _track_key(song)
-                if song["videoId"] in seen_ids or key in seen_keys:
+                keys = _track_keys(song)
+                if song["videoId"] in seen_ids or keys & seen_keys:
                     continue
                 seen_ids.add(song["videoId"])
-                seen_keys.add(key)
+                seen_keys.update(keys)
                 picked.append(song)
                 break
             if len(picked) >= cap:
@@ -980,7 +998,7 @@ async def tool_recommend_for_playlist(
         return bool(
             song["videoId"]
             and song["videoId"] not in known_ids
-            and _track_key(song) not in known_keys
+            and not _track_keys(song) & known_keys
             and (include_variants or not _is_variant(song["title"]))
             and _norm(artist) in {_norm(a) for a in song["artists"]}
         )
@@ -1013,9 +1031,9 @@ async def tool_recommend_for_playlist(
     loop = asyncio.get_running_loop()
     results = await asyncio.gather(*[loop.run_in_executor(_YT_POOL, fetch, cid) for cid in artist_ids])
 
-    in_playlist = [_song_to_dict(t) for t in tracks]
+    in_playlist = [_rec_song(t) for t in tracks]
     seen_ids = {s["videoId"] for s in in_playlist if s["videoId"]}
-    seen_keys = {_track_key(s) for s in in_playlist}
+    seen_keys = set().union(*(_track_keys(s) for s in in_playlist))
     novedades = _interleave([new for _, new, _ in results], max_novedades, seen_ids, seen_keys)
     hits = _interleave([top for _, _, top in results], max_hits, seen_ids, seen_keys)
 
@@ -1120,7 +1138,7 @@ async def tool_apply_proposals_review(
             yt.add_playlist_items(playlist_id, add_video_ids, duplicates=False)
         discards = json.loads(_DISCARDS_PATH.read_text()) if _DISCARDS_PATH.exists() else []
         already = {d.get("videoId") for d in discards}
-        new = [_song_to_dict(by_id[v]) for v in discard_video_ids if v in by_id and v not in already]
+        new = [_rec_song(by_id[v]) for v in discard_video_ids if v in by_id and v not in already]
         _DISCARDS_PATH.write_text(json.dumps(discards + new, ensure_ascii=False, indent=1))
         _empty_playlist(yt, proposals_id, tracks)
     except Exception as exc:

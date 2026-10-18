@@ -609,6 +609,20 @@ class TestRecommendations:
         assert not server._is_variant("Live Your Life")
         assert not server._is_variant("Clean Hands")
 
+    def test_track_keys_match_music_video_and_audio_versions(self):
+        def same(a, b):
+            return bool(server._track_keys(a) & server._track_keys(b))
+
+        # Discarded music video credited to a featured artist vs. the audio track.
+        assert same({"title": "PARADIXE", "artist": "Pirlo"},
+                    {"title": "PARADIXE", "artists": ["Feid", "El Americano 4KT", "Pirlo"]})
+        assert same({"title": "TRATRATRA - ANMI, JUSEPH, AISSA (Video Oficial)", "artist": "anmi"},
+                    {"title": "TRATRATRA", "artists": ["Anmi", "Juseph", "Aissa"]})
+        assert same({"title": "Gotay El Autentiko, Jowell & Randy, Pailita - Te Pillé", "artist": "Gotay El Autentiko"},
+                    {"title": "Te Pillé", "artists": ["Gotay \"El Autentiko\"", "Jowell & Randy"]})
+        assert not same({"title": "LUNA", "artists": ["Feid"]}, {"title": "LUNA", "artists": ["Otro"]})
+        assert not same({"title": "Volando", "artists": ["Mora"]}, {"title": "Volando (Remix)", "artists": ["Mora"]})
+
     def test_plays(self):
         assert server._plays({"views": "3.4M plays"}) == 3_400_000
         assert server._plays({"views": "850K plays"}) == 850_000
