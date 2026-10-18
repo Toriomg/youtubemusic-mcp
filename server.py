@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from collections import Counter
@@ -155,7 +156,7 @@ def _build_browser_json_from_cookie(cookie_path: Path, browser_path: Path) -> No
         ),
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.5",
-        "X-Goog-AuthUser": "0",
+        "X-Goog-AuthUser": os.environ.get("YTMUSIC_AUTHUSER", "0"),  # account slot when several are signed in
         "x-origin": "https://music.youtube.com",
         "Cookie": cookie_string,
         "authorization": authorization,

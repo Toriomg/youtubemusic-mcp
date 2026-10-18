@@ -11,6 +11,7 @@ this script manually is optional.  It's still useful for:
 
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -89,7 +90,7 @@ def update_auth() -> bool:
         ),
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.5",
-        "X-Goog-AuthUser": "0",
+        "X-Goog-AuthUser": os.environ.get("YTMUSIC_AUTHUSER", "0"),  # account slot when several are signed in
         "x-origin": "https://music.youtube.com",
         "Cookie": cookie_string,
         "authorization": authorization,
